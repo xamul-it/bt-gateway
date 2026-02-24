@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bt-alpaca-zmq"
+version = "0.1.0"
+description = "ZMQ gateway services for trading stream proxy, logger, and replay"
+requires-python = ">=3.10"
+dependencies = [
+  "alpaca-py>=0.28,<1.0",
+  "pandas>=2.0,<3.0",
+  "pyzmq>=25,<27",
+]
+
+[project.scripts]
+bt-alpaca-zmq-proxy = "bt_alpaca_zmq.cli:alpaca_proxy"
+bt-alpaca-zmq-logger = "bt_alpaca_zmq.cli:zmq_logger"
+bt-alpaca-zmq-replay = "bt_alpaca_zmq.cli:replay_proxy"
+
+[tool.setuptools]
+packages = ["bt_alpaca_zmq"]
