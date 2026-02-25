@@ -1,5 +1,6 @@
 import zmq
 import logging
+import os
 from datetime import datetime, timezone
 import pickle  # Necessario se il server usa send_pyobj con pickle
 import json
@@ -7,8 +8,16 @@ from pathlib import Path
 from decimal import Decimal
 from typing import Any, Dict
 
-# Configurazione ZeroMQ
-ZMQ_SERVER_ADDR = "tcp://127.0.0.1:5556"  # Cambia con l'indirizzo del tuo server
+# Configurazione ZeroMQ:
+# Priorita':
+# 1) proxy_pub_addr (compatibile con env/zmq)
+# 2) ZMQ_SERVER_ADDR (override esplicito)
+# 3) default locale
+ZMQ_SERVER_ADDR = (
+    os.environ.get("proxy_pub_addr")
+    or os.environ.get("ZMQ_SERVER_ADDR")
+    or "tcp://127.0.0.1:5556"
+)
 
 # Configurazione logging
 OUTPUT_DIR = Path("out") / "dump"
