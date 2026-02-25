@@ -91,7 +91,21 @@ class AlpacaSmartProxy:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._stream_ready_event = threading.Event()
+        self._stopping = False
 
+    def _broadcast_eod(self, reason="proxy_stop"):
+        """Invia EOD broadcast a tutti i subscriber."""
+        eod_msg = {
+            'type':        'EOD',
+            'daily':       False,
+            'asset_class': 'stock',
+            'symbol':      '*',
+            'data':        None,
+            'timestamp':   time.time(),
+            'reason':      reason,
+        }
+        self.publisher.send_pyobj(eod_msg)
+        self.logger.info(f"EOD broadcast inviato (reason={reason})")
 
     def _get_client_id_str(self, client_id):
         """Converti client_id in stringa leggibile"""
@@ -508,17 +522,24 @@ class AlpacaSmartProxy:
             self.stop()
             raise
 
-    def stop(self):
+    def stop(self, eod_reason="proxy_stop"):
         """Arresta il servizio proxy"""
+        if self._stopping:
+            self.logger.info("stop() già in corso, ignoro chiamata duplicata")
+            return
+        self._stopping = True
         self.logger.info("Arresto proxy in corso...")
         self.running = False
         # Garantisci che eventuali thread in attesa vengano sbloccati
         self._stream_ready_event.set()
 
-        # NON inviamo EOD automatico su stop() perché:
-        # - un restart del proxy non deve terminare le strategie live
-        # - per chiusura controllata a fine giornata usare: send_eod_signal()
-        # self.publisher.send_pyobj({'type': 'EOD', ...})  # ← rimosso
+        # Nuovo comportamento: invia sempre EOD allo stop del proxy
+        # per consentire shutdown ordinato dei consumer.
+        try:
+            self._broadcast_eod(reason=eod_reason)
+            time.sleep(0.5)  # breve finestra per consentire consegna ai subscriber
+        except Exception as e:
+            self.logger.warning(f"EOD broadcast fallito in stop(): {e}")
         
         try:
             if self.cleanup_thread:
@@ -581,30 +602,23 @@ if __name__ == "__main__":
             kill -USR1 <pid>
         """
         proxy.logger.info("SIGUSR1: invio EOD ai client e arresto controllato...")
-        try:
-            eod_msg = {
-                'type':        'EOD',
-                'daily':       False,
-                'asset_class': 'stock',
-                'symbol':      '*',
-                'data':        None,
-                'timestamp':   time.time(),
-                'reason':      'eod_manual',
-            }
-            proxy.publisher.send_pyobj(eod_msg)
-            proxy.logger.info("EOD broadcast inviato (eod_manual)")
-            time.sleep(0.5)  # Attendi ricezione dai client
-        except Exception as e:
-            proxy.logger.warning(f"EOD broadcast fallito: {e}")
-        proxy.stop()
+        proxy.stop(eod_reason="eod_manual")
 
     _signal.signal(_signal.SIGUSR1, _handle_sigusr1)
+
+    def _handle_stop_signal(signum, frame):
+        sname = _signal.Signals(signum).name
+        proxy.logger.info(f"Segnale {sname} ricevuto: stop proxy con EOD")
+        proxy.stop(eod_reason="proxy_stop")
+
+    _signal.signal(_signal.SIGTERM, _handle_stop_signal)
+    _signal.signal(_signal.SIGINT, _handle_stop_signal)
 
     try:
         proxy.start()
     except KeyboardInterrupt:
         proxy.logger.info("Ricevuto CTRL+C, arresto...")
-        proxy.stop()
+        proxy.stop(eod_reason="proxy_stop")
     except Exception as e:
         proxy.logger.critical(f"Errore irreversibile: {e}")
-        proxy.stop() 
+        proxy.stop(eod_reason="proxy_error")
