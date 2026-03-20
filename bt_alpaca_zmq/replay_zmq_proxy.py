@@ -25,6 +25,7 @@ Per usarlo con btmain.py:
 
 import sys
 import zmq
+import msgpack
 import threading
 import time
 import json
@@ -35,8 +36,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 import pandas as pd
-
-from alpaca.data.models import Bar as AlpacaBar
 
 
 # ---------------------------------------------------------------------------
@@ -229,47 +228,44 @@ class ReplayProxy:
     def _publish_bar(self, symbol: str, bar_dict: dict):
         """Pubblica un bar via PUB. Thread-safe.
 
-        Costruisce una vera alpaca.data.models.Bar usando le chiavi corte
-        del protocollo Alpaca (t/o/h/l/c/v/n/vw), identica a quella che
-        il proxy di produzione riceve dal WebSocket Alpaca. Il client non
-        sa distinguere replay da live.
+        OPT-C/D: flat msgpack message con topic = symbol (per-symbol ZMQ filter).
+        Compatibile con il formato del proxy di produzione.
         """
         ts = self._remap_ts(bar_dict['timestamp'])
-        # Bar accetta timestamp come stringa ISO o datetime
-        raw = {
-            't':  ts.isoformat() if hasattr(ts, 'isoformat') else ts,
-            'o':  bar_dict['open'],
-            'h':  bar_dict['high'],
-            'l':  bar_dict['low'],
-            'c':  bar_dict['close'],
-            'v':  bar_dict['volume'],
-            'n':  bar_dict.get('trade_count', 0),
-            'vw': bar_dict.get('vwap', 0.0),
-        }
-        bar = AlpacaBar(symbol, raw)
         msg = {
+            'type':        'bar',
             'daily':       False,
             'asset_class': 'stock',
             'symbol':      symbol,
-            'data':        bar,
-            'timestamp':   time.time(),
+            'ts':          ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+            'open':        float(bar_dict['open']),
+            'high':        float(bar_dict['high']),
+            'low':         float(bar_dict['low']),
+            'close':       float(bar_dict['close']),
+            'volume':      float(bar_dict['volume']),
+            'trade_count': float(bar_dict.get('trade_count', 0)),
+            'vwap':        float(bar_dict.get('vwap', 0.0)),
+            'proxy_ts':    time.time(),
         }
         with self._pub_lock:
-            self.publisher.send_pyobj(msg)
+            self.publisher.send_multipart([symbol.encode(), msgpack.packb(msg)])
 
     def _broadcast_eod(self, reason: str = 'day_complete'):
         """Invia segnale EOD broadcast a tutti i subscriber."""
+        # OPT-C/D: topic '*' + msgpack flat payload
         msg = {
             'type':        'EOD',
             'daily':       False,
             'asset_class': 'stock',
             'symbol':      '*',
-            'data':        None,
-            'timestamp':   time.time(),
+            'ts':          None,
+            'open': 0.0, 'high': 0.0, 'low': 0.0, 'close': 0.0, 'volume': 0.0,
+            'trade_count': 0.0, 'vwap': 0.0,
+            'proxy_ts':    time.time(),
             'reason':      reason,
         }
         with self._pub_lock:
-            self.publisher.send_pyobj(msg)
+            self.publisher.send_multipart([b'*', msgpack.packb(msg)])
         self.logger.info(f"EOD broadcast: {reason}")
 
     # ------------------------------------------------------------------

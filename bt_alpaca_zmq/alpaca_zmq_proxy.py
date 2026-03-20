@@ -1,5 +1,6 @@
 import asyncio
 import zmq
+import msgpack
 from alpaca.data.enums import DataFeed
 from alpaca.data.live import StockDataStream, CryptoDataStream
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
@@ -95,16 +96,19 @@ class AlpacaSmartProxy:
 
     def _broadcast_eod(self, reason="proxy_stop"):
         """Invia EOD broadcast a tutti i subscriber."""
+        # OPT-C/D: topic '*' + msgpack flat payload (no pickle, no nested objects)
         eod_msg = {
             'type':        'EOD',
             'daily':       False,
             'asset_class': 'stock',
             'symbol':      '*',
-            'data':        None,
-            'timestamp':   time.time(),
+            'ts':          None,
+            'open': 0.0, 'high': 0.0, 'low': 0.0, 'close': 0.0, 'volume': 0.0,
+            'trade_count': 0.0, 'vwap': 0.0,
+            'proxy_ts':    time.time(),
             'reason':      reason,
         }
-        self.publisher.send_pyobj(eod_msg)
+        self.publisher.send_multipart([b'*', msgpack.packb(eod_msg)])
         self.logger.info(f"EOD broadcast inviato (reason={reason})")
 
     def _get_client_id_str(self, client_id):
@@ -282,20 +286,30 @@ class AlpacaSmartProxy:
 
             if matched_symbol not in subscribers:
                 return
-                
+
+            # OPT-C/D: flat msgpack message, topic = symbol (per-symbol ZMQ filter)
+            ts = bar.timestamp
             msg = {
-                'daily' : daily, 
+                'type':        'bar',
+                'daily':       daily,
                 'asset_class': asset_class,
-                'symbol': matched_symbol,
-                'data': bar,
-                'timestamp': time.time()
+                'symbol':      matched_symbol,
+                'ts':          ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+                'open':        float(bar.open),
+                'high':        float(bar.high),
+                'low':         float(bar.low),
+                'close':       float(bar.close),
+                'volume':      float(bar.volume),
+                'trade_count': float(bar.trade_count) if bar.trade_count is not None else 0.0,
+                'vwap':        float(bar.vwap) if bar.vwap is not None else 0.0,
+                'proxy_ts':    time.time(),
             }
 
             if subscribers[matched_symbol]:
-                self.publisher.send_pyobj(msg)
+                self.publisher.send_multipart([matched_symbol.encode(), msgpack.packb(msg)])
                 daily_str = "daily" if daily else "intraday"
                 self.logger.debug(f"Inviato dato {matched_symbol} {daily_str} a {len(subscribers[matched_symbol])} client")
-                
+
         except Exception as e:
             self.logger.error(f"Errore in _on_bar: {e}")
 
