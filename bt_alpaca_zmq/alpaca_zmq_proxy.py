@@ -1,29 +1,26 @@
-import asyncio
-import zmq
-import msgpack
-from alpaca.data.enums import DataFeed
-from alpaca.data.live import StockDataStream, CryptoDataStream
-from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
-from alpaca.data.timeframe import TimeFrame
-import threading
-from collections import defaultdict
-import time
-import uuid
+import argparse
+import datetime
 import logging
-from logging.handlers import TimedRotatingFileHandler
 import os
 import pickle
-import datetime
+import signal as _signal
+import subprocess
+import sys
+import threading
+import time
+from collections import defaultdict
 
-API_KEY = (
-    os.environ.get('ALPACA_API_KEY')
-    or os.environ.get('ALPACA_KEY')
-)
-SECRET_KEY = (
-    os.environ.get('ALPACA_SECRET_KEY')
-    or os.environ.get('ALPACA_SECRET')
-)
+import msgpack
+import zmq
+from alpaca.data.enums import DataFeed
+from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+
+from process_monitor import ProcessMonitor
+
+API_KEY = os.environ.get("ALPACA_API_KEY") or os.environ.get("ALPACA_KEY")
+SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("ALPACA_SECRET")
 FEED = os.environ.get("ALPACA_DATA_FEED", "sip")
 
 if not API_KEY or not SECRET_KEY:
@@ -32,292 +29,256 @@ if not API_KEY or not SECRET_KEY:
         "oppure ALPACA_KEY/ALPACA_SECRET"
     )
 
-class AlpacaSmartProxy:
-    def __init__(self, log_level):
-        # Configurazione logging
-        self._setup_logging(log_level)
-        self.logger = logging.getLogger('AlpacaProxy')
-        
-        self.context = zmq.Context()
 
-        # Socket configuration
-        try:
-            self.router = self.context.socket(zmq.ROUTER)
-            self.router.setsockopt(zmq.ROUTER_HANDOVER, 1)  # Importante!
-            self.router.setsockopt(zmq.ROUTER_MANDATORY, 1)
-            self.router.setsockopt(zmq.IMMEDIATE, 1)
-            self.router.bind("tcp://*:5555")
-            self.publisher = self.context.socket(zmq.PUB)
-            self.publisher.bind("tcp://*:5556")
-        except zmq.ZMQError as e:
-            self.logger.critical(f"Errore inizializzazione socket ZMQ: {e}")
-            raise
+class AlpacaSmartProxy:
+    def __init__(self, log_level, router_bind, pub_bind, cmd_endpoint, event_endpoint, monitor_seconds):
+        self._setup_logging(log_level)
+        self.logger = logging.getLogger("AlpacaProxy")
+        self.monitor = ProcessMonitor("CTRL", self.logger, monitor_seconds, self._monitor_metrics)
+
+        self.context = zmq.Context()
+        self.router = self.context.socket(zmq.ROUTER)
+        self.router.setsockopt(zmq.ROUTER_HANDOVER, 1)
+        self.router.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        self.router.setsockopt(zmq.IMMEDIATE, 1)
+        self.router.setsockopt(zmq.RCVTIMEO, 1000)
+        self.router.setsockopt(zmq.LINGER, 0)
+        self.router.bind(router_bind)
+
+        self.publisher = self.context.socket(zmq.PUB)
+        self.publisher.setsockopt(zmq.LINGER, 0)
+        self.publisher.bind(pub_bind)
+
+        self.router_bind = router_bind
+        self.pub_bind = pub_bind
+        self.worker_cmd_endpoint = cmd_endpoint
+        self.worker_event_endpoint = event_endpoint
+        self.worker_command_socket = self.context.socket(zmq.PUSH)
+        self.worker_command_socket.setsockopt(zmq.IMMEDIATE, 1)
+        self.worker_command_socket.setsockopt(zmq.SNDTIMEO, 1000)
+        self.worker_command_socket.setsockopt(zmq.LINGER, 0)
+        self.worker_command_socket.bind(self.worker_cmd_endpoint)
+
+        self.worker_event_socket = self.context.socket(zmq.PULL)
+        self.worker_event_socket.setsockopt(zmq.RCVTIMEO, 1000)
+        self.worker_event_socket.setsockopt(zmq.LINGER, 0)
+        self.worker_event_socket.bind(self.worker_event_endpoint)
+
+        self.worker_process = None
+        self.worker_log_level = logging.getLevelName(log_level)
+        self.monitor_seconds = monitor_seconds
 
         self.heartbeats = {}
-
-        # Data structures
         self.client_assets = defaultdict(set)
         self.asset_subscribers = defaultdict(set)
         self.active_alpaca_symbols = set()
         self.active_alpaca_crypto_symbols = set()
-
-        # Aggiungi queste strutture dati
         self.client_daily_assets = defaultdict(set)
         self.daily_asset_subscribers = defaultdict(set)
         self.active_alpaca_daily_symbols = set()
+
         if FEED == "sip":
-            DATA_FEED = DataFeed.SIP
+            data_feed = DataFeed.SIP
         elif FEED == "iex":
-            DATA_FEED = DataFeed.IEX
+            data_feed = DataFeed.IEX
         else:
-            DATA_FEED = DataFeed.SIP
-        # Alpaca connection
-        try:
-            self.alpaca_stream = StockDataStream(API_KEY, SECRET_KEY, feed=DATA_FEED)
-            self.alpaca_crypto_stream = CryptoDataStream(API_KEY, SECRET_KEY)
-            self._stock_hist_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-            self._crypto_hist_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
-            self._stock_hist_client._session.verify = False
-            self._crypto_hist_client._session.verify = False
-            self._data_feed = DATA_FEED
-        except Exception as e:
-            self.logger.critical(f"Errore connessione Alpaca: {e}")
-            raise
+            data_feed = DataFeed.SIP
+
+        self._stock_hist_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+        self._crypto_hist_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
+        self._stock_hist_client._session.verify = False
+        self._crypto_hist_client._session.verify = False
+        self._data_feed = data_feed
 
         self.running = False
+        self._stopping = False
+        self._requested_stop_reason = None
         self.cleanup_thread = None
+        self.client_thread = None
+        self.worker_event_thread = None
         self.alive_log_interval_s = 300
         self._last_alive_log = 0.0
 
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._stream_ready_event = threading.Event()
-        self._stopping = False
-
-    def _broadcast_eod(self, reason="proxy_stop"):
-        """Invia EOD broadcast a tutti i subscriber."""
-        # OPT-C/D: topic '*' + msgpack flat payload (no pickle, no nested objects)
-        eod_msg = {
-            'type':        'EOD',
-            'daily':       False,
-            'asset_class': 'stock',
-            'symbol':      '*',
-            'ts':          None,
-            'open': 0.0, 'high': 0.0, 'low': 0.0, 'close': 0.0, 'volume': 0.0,
-            'trade_count': 0.0, 'vwap': 0.0,
-            'proxy_ts':    time.time(),
-            'reason':      reason,
-        }
-        self.publisher.send_multipart([b'*', msgpack.packb(eod_msg)])
-        self.logger.info(f"EOD broadcast inviato (reason={reason})")
-
-    def _get_client_id_str(self, client_id):
-        """Converti client_id in stringa leggibile"""
-        try:
-            if isinstance(client_id, bytes):
-                return client_id.hex()[:8]
-            elif isinstance(client_id, str):
-                return client_id[:8]
-            else:
-                return str(client_id)[:8]
-        except Exception:
-            return "UNKNOWN_ID"
-
-    def _safe_remove_client(self, client_id):
-        """Rimozione client con gestione ID robusta"""
-        if client_id not in self.heartbeats:
-            client_id_str = self._get_client_id_str(client_id)
-            self.logger.debug(f"Tentativo rimozione client inesistente: {client_id_str}")
-            return
-        
-        client_id_str = self._get_client_id_str(client_id)
-        try:
-            # Rimuovi tutte le sottoscrizioni intraday
-            if client_id in self.client_assets:
-                for symbol in list(self.client_assets.get(client_id, set())):
-                    self.asset_subscribers[symbol].discard(client_id)
-                    if not self.asset_subscribers[symbol]:
-                        try:
-                            if symbol in self.active_alpaca_crypto_symbols:
-                                self.alpaca_crypto_stream.unsubscribe_bars(symbol)
-                                self.active_alpaca_crypto_symbols.remove(symbol)
-                            else:
-                                self.alpaca_stream.unsubscribe_bars(symbol)
-                                self.active_alpaca_symbols.remove(symbol)
-                            self.logger.info(f"Rimosso simbolo intraday {symbol} (nessun client)")
-                        except Exception as e:
-                            self.logger.error(f"Errore rimozione intraday {symbol}: {e}")
-            # Rimuovi tutte le sottoscrizioni giornaliere
-            if client_id in self.client_daily_assets:
-                for symbol in list(self.client_daily_assets.get(client_id, set())):
-                    self.daily_asset_subscribers[symbol].discard(client_id)
-                    if not self.daily_asset_subscribers[symbol]:
-                        try:
-                            self.alpaca_stream.unsubscribe_daily_bars(symbol)
-                            self.active_alpaca_daily_symbols.remove(symbol)
-                            self.logger.info(f"Rimosso simbolo giornaliero {symbol} (nessun client)")
-                        except Exception as e:
-                            self.logger.error(f"Errore rimozione giornaliera {symbol}: {e}")
-
-            else:
-                self.logger.debug(f"Nessun simbolo registrato per: {client_id_str}")
-            
-            # Pulisci strutture dati
-            for registry in [self.client_assets, self.client_daily_assets, self.heartbeats]:
-                if client_id in registry:   
-                    del registry[client_id]
-            
-            self.logger.info(f"Client {client_id_str} rimosso correttamente")
-            
-        except Exception as e:
-            self.logger.error(f"Errore rimozione {client_id_str}: {e}")
-
-
     def _setup_logging(self, log_level=logging.INFO):
-        """Configura il sistema di logging avanzato"""
-        logger = logging.getLogger('AlpacaProxy')
+        logger = logging.getLogger("AlpacaProxy")
         logger.setLevel(log_level)
-        
-        # Formattatore
         formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
         )
-        
-
-        # Console handler
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
         console_handler.setLevel(log_level)
-        
+        logger.handlers.clear()
         logger.addHandler(console_handler)
 
-    # Opzione 2: usa una funzione wrapper esplicita
-    async def _alpaca_callback(self, bar):
-        await self._on_bar(bar)
-        
-    async def _alpaca_daily_callback(self, bar):
-        await self._on_bar(bar,daily=True)
+    def _monitor_metrics(self):
+        return {
+            "clients": len(self.heartbeats),
+            "intraday_syms": len(self.active_alpaca_symbols) + len(self.active_alpaca_crypto_symbols),
+            "daily_syms": len(self.active_alpaca_daily_symbols),
+            "worker_pid": self.worker_process.pid if self.worker_process else "na",
+        }
 
-    async def _alpaca_crypto_callback(self, bar):
-        await self._on_bar(bar, daily=False, asset_class='crypto')
+    def _broadcast_eod(self, reason="proxy_stop"):
+        eod_msg = {
+            "type": "EOD",
+            "daily": False,
+            "asset_class": "stock",
+            "symbol": "*",
+            "ts": None,
+            "open": 0.0,
+            "high": 0.0,
+            "low": 0.0,
+            "close": 0.0,
+            "volume": 0.0,
+            "trade_count": 0.0,
+            "vwap": 0.0,
+            "proxy_ts": time.time(),
+            "reason": reason,
+        }
+        self.publisher.send_multipart([b"*", msgpack.packb(eod_msg, use_bin_type=True)])
+        self.logger.info("EOD broadcast inviato (reason=%s)", reason)
 
-    def _add_subscription(self, client_id, symbol, timeframe=None, asset_class='stock'):
-        """Gestisce una nuova sottoscrizione con supporto asincrono"""
+    def request_stop(self, reason="proxy_stop"):
+        self._requested_stop_reason = reason
+        self.running = False
+
+    def _get_client_id_str(self, client_id):
         try:
-            is_crypto = asset_class == 'crypto'
-            if timeframe == 'daily':
+            if isinstance(client_id, bytes):
+                return client_id.hex()[:8]
+            if isinstance(client_id, str):
+                return client_id[:8]
+            return str(client_id)[:8]
+        except Exception:
+            return "UNKNOWN_ID"
+
+    def _send_worker_command(self, action, symbol=None, timeframe="minute", asset_class="stock"):
+        command = {
+            "action": action,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "asset_class": asset_class,
+        }
+        self.worker_command_socket.send(msgpack.packb(command, use_bin_type=True))
+
+    def _start_worker(self):
+        worker_path = os.path.join(os.path.dirname(__file__), "alpaca_stream_worker.py")
+        cmd = [
+            sys.executable,
+            worker_path,
+            "--cmd-endpoint",
+            self.worker_cmd_endpoint,
+            "--event-endpoint",
+            self.worker_event_endpoint,
+            "--log-level",
+            self.worker_log_level,
+            "--monitor-seconds",
+            str(self.monitor_seconds),
+        ]
+        self.worker_process = subprocess.Popen(cmd, cwd=os.path.dirname(__file__))
+        self.logger.info("Worker Alpaca lanciato pid=%s", self.worker_process.pid)
+
+    def _stop_worker(self):
+        if not self.worker_process:
+            return
+        try:
+            self._send_worker_command("shutdown")
+        except Exception as exc:
+            self.logger.warning("Invio shutdown al worker fallito: %s", exc)
+        try:
+            self.worker_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Worker non terminato in tempo, invio SIGTERM")
+            self.worker_process.terminate()
+            try:
+                self.worker_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.logger.warning("Worker non terminato dopo SIGTERM, invio SIGKILL")
+                self.worker_process.kill()
+                self.worker_process.wait(timeout=5)
+        self.logger.info("Worker Alpaca arrestato")
+
+    def _safe_remove_client(self, client_id):
+        if client_id not in self.heartbeats:
+            self.logger.debug("Tentativo rimozione client inesistente: %s", self._get_client_id_str(client_id))
+            return
+
+        client_id_str = self._get_client_id_str(client_id)
+        try:
+            for symbol in list(self.client_assets.get(client_id, set())):
+                self.asset_subscribers[symbol].discard(client_id)
+                if not self.asset_subscribers[symbol]:
+                    asset_class = "crypto" if symbol in self.active_alpaca_crypto_symbols else "stock"
+                    self._send_worker_command("unsubscribe", symbol=symbol, timeframe="minute", asset_class=asset_class)
+                    if asset_class == "crypto":
+                        self.active_alpaca_crypto_symbols.discard(symbol)
+                    else:
+                        self.active_alpaca_symbols.discard(symbol)
+                    self.logger.info("Rimosso simbolo intraday %s (nessun client)", symbol)
+
+            for symbol in list(self.client_daily_assets.get(client_id, set())):
+                self.daily_asset_subscribers[symbol].discard(client_id)
+                if not self.daily_asset_subscribers[symbol]:
+                    self._send_worker_command("unsubscribe", symbol=symbol, timeframe="daily", asset_class="stock")
+                    self.active_alpaca_daily_symbols.discard(symbol)
+                    self.logger.info("Rimosso simbolo giornaliero %s (nessun client)", symbol)
+
+            for registry in [self.client_assets, self.client_daily_assets, self.heartbeats]:
+                if client_id in registry:
+                    del registry[client_id]
+
+            self.logger.info("Client %s rimosso correttamente", client_id_str)
+        except Exception as exc:
+            self.logger.error("Errore rimozione %s: %s", client_id_str, exc, exc_info=True)
+
+    def _add_subscription(self, client_id, symbol, timeframe=None, asset_class="stock"):
+        try:
+            is_crypto = asset_class == "crypto"
+            if timeframe == "daily":
                 if is_crypto:
                     raise ValueError("Sottoscrizione daily crypto non supportata in live stream")
                 prev_count = len(self.daily_asset_subscribers.get(symbol, set()))
                 registry = self.client_daily_assets
                 subscribers = self.daily_asset_subscribers
                 active_symbols = self.active_alpaca_daily_symbols
-                alpaca_method = self.alpaca_stream.subscribe_daily_bars
-                callback = self._alpaca_daily_callback
                 sub_type = "daily"
             else:
                 prev_count = len(self.asset_subscribers.get(symbol, set()))
                 registry = self.client_assets
                 subscribers = self.asset_subscribers
-                if is_crypto:
-                    active_symbols = self.active_alpaca_crypto_symbols
-                    alpaca_method = self.alpaca_crypto_stream.subscribe_bars
-                    callback = self._alpaca_crypto_callback
-                    sub_type = "intraday-crypto"
-                else:
-                    active_symbols = self.active_alpaca_symbols
-                    alpaca_method = self.alpaca_stream.subscribe_bars
-                    callback = self._alpaca_callback
-                    sub_type = "intraday"
+                active_symbols = self.active_alpaca_crypto_symbols if is_crypto else self.active_alpaca_symbols
+                sub_type = "intraday-crypto" if is_crypto else "intraday"
 
-
-
-            
-            # Inizializza strutture dati se necessarie
-            if client_id not in registry:
-                registry[client_id] = set()
-                
-            # Aggiungi sottoscrizioni
-            registry[client_id].add(symbol)
+            registry.setdefault(client_id, set()).add(symbol)
             subscribers.setdefault(symbol, set()).add(client_id)
             self.heartbeats[client_id] = time.time()
 
-            self.logger.debug(f"Client {self._get_client_id_str(client_id)} sottoscritto a {symbol} ({sub_type})")
+            self.logger.debug(
+                "Client %s sottoscritto a %s (%s)",
+                self._get_client_id_str(client_id),
+                symbol,
+                sub_type,
+            )
 
-            # Sottoscrivi ad Alpaca solo se primo client
             if prev_count == 0 and symbol not in active_symbols:
-                try:
-                    # Modifica chiave: usa una lambda che richiami la coroutin
-                    alpaca_method(callback, symbol)
-                    active_symbols.add(symbol)
-                    self.logger.info(f"Sottoscritto a nuovo simbolo: {symbol}")
-                    # Abilita l'avvio dello stream al primo simbolo registrato
-                    self._stream_ready_event.set()
-                except Exception as e:
-                    self.logger.exception(e)
-                    self.logger.error(f"Errore sottoscrizione Alpaca per {symbol}: {e}")
-                    # Ripulisci in caso di errore
-                    subscribers[symbol].discard(client_id)
-                    registry[client_id].discard(symbol)
-                    raise
-
-        except Exception as e:
-            self.logger.error(f"Errore in _add_subscription: {e}")
+                worker_timeframe = "daily" if timeframe == "daily" else "minute"
+                self._send_worker_command(
+                    "subscribe",
+                    symbol=symbol,
+                    timeframe=worker_timeframe,
+                    asset_class=asset_class,
+                )
+                active_symbols.add(symbol)
+                self.logger.info("Nuovo simbolo registrato: %s (%s)", symbol, sub_type)
+        except Exception as exc:
+            self.logger.error("Errore in _add_subscription: %s", exc, exc_info=True)
             raise
 
-
-    async def _on_bar(self, bar, daily=False, asset_class='stock'):
-        """Callback asincrono per dati in tempo reale"""
-        try:
-            subscribers = self.daily_asset_subscribers  if daily else self.asset_subscribers
-            symbol = bar.symbol
-
-            def _symbol_key(value):
-                return str(value).replace("/", "").upper()
-
-            matched_symbol = symbol
-            if matched_symbol not in subscribers and asset_class == 'crypto':
-                stream_key = _symbol_key(symbol)
-                for sub_symbol in subscribers.keys():
-                    if _symbol_key(sub_symbol) == stream_key:
-                        matched_symbol = sub_symbol
-                        break
-
-            if matched_symbol not in subscribers:
-                return
-
-            # OPT-C/D: flat msgpack message, topic = symbol (per-symbol ZMQ filter)
-            ts = bar.timestamp
-            msg = {
-                'type':        'bar',
-                'daily':       daily,
-                'asset_class': asset_class,
-                'symbol':      matched_symbol,
-                'ts':          ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
-                'open':        float(bar.open),
-                'high':        float(bar.high),
-                'low':         float(bar.low),
-                'close':       float(bar.close),
-                'volume':      float(bar.volume),
-                'trade_count': float(bar.trade_count) if bar.trade_count is not None else 0.0,
-                'vwap':        float(bar.vwap) if bar.vwap is not None else 0.0,
-                'proxy_ts':    time.time(),
-            }
-
-            if subscribers[matched_symbol]:
-                self.publisher.send_multipart([matched_symbol.encode(), msgpack.packb(msg)])
-                daily_str = "daily" if daily else "intraday"
-                self.logger.debug(f"Inviato dato {matched_symbol} {daily_str} a {len(subscribers[matched_symbol])} client")
-
-        except Exception as e:
-            self.logger.error(f"Errore in _on_bar: {e}")
-
-
     def _cleanup_dead_clients(self):
-        """Pulizia client inattivi con logging più informativo"""
         while self.running:
-            time.sleep(10)  # Controlla ogni 10 secondi
+            time.sleep(10)
             try:
                 now = time.time()
                 if now - self._last_alive_log >= self.alive_log_interval_s:
@@ -326,94 +287,106 @@ class AlpacaSmartProxy:
                     total_daily = len(self.active_alpaca_daily_symbols)
                     total_symbols = total_intraday + total_daily
                     self.logger.info(
-                        f"Alive: {total_clients} client, {total_intraday} intraday + "
-                        f"{total_daily} daily = {total_symbols} titoli"
+                        "Alive: %s client, %s intraday + %s daily = %s titoli",
+                        total_clients,
+                        total_intraday,
+                        total_daily,
+                        total_symbols,
                     )
                     self._last_alive_log = now
-                dead_clients = []
-                
-                for client_id, last_hb in list(self.heartbeats.items()):
-                    client_id_str = client_id.hex()[:8] if hasattr(client_id, 'hex') else str(client_id)[:8]
-                    if now - last_hb > 30:  # Timeout 30 secondi
-                        dead_clients.append(client_id)
-                        self.logger.warning(f"Client [{client_id_str}] inattivo da {int(now - last_hb)}s ")
-                    else:
-                        self.logger.debug(f"Client [{client_id_str}] attivo (ultimo hb {int(now - last_hb)}s fa)")
-                
+                dead_clients = [
+                    client_id
+                    for client_id, last_hb in list(self.heartbeats.items())
+                    if now - last_hb > 30
+                ]
                 for client_id in dead_clients:
-                    pass
+                    self.logger.warning(
+                        "Client [%s] inattivo da %ss",
+                        self._get_client_id_str(client_id),
+                        int(now - self.heartbeats[client_id]),
+                    )
                     self._safe_remove_client(client_id)
-                    
-            except Exception as e:
-                self.logger.error(f"Errore in cleanup: {e}")
+            except Exception as exc:
+                self.logger.error("Errore in cleanup: %s", exc, exc_info=True)
 
+    def _handle_worker_events(self):
+        while self.running:
+            try:
+                parts = self.worker_event_socket.recv_multipart()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError as exc:
+                if self.running:
+                    self.logger.error("Errore socket eventi worker: %s", exc, exc_info=True)
+                break
+            if len(parts) != 2:
+                self.logger.warning("Evento worker con formato errato: %s", parts)
+                continue
+            topic, payload = parts
+            try:
+                self.publisher.send_multipart([topic, payload])
+            except Exception as exc:
+                self.logger.error("Errore publish verso consumer: %s", exc, exc_info=True)
 
     def _handle_client_messages(self):
-        """Gestione messaggi client con gestione ID robusta"""
         while self.running:
             try:
                 parts = self.router.recv_multipart()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError as exc:
+                if self.running:
+                    self.logger.error("Errore ZMQ: %s", exc, exc_info=True)
+                break
+
+            try:
                 if len(parts) == 3:
-                    client_id, b, message = parts
+                    client_id, _, message = parts
                 elif len(parts) == 2:
                     client_id, message = parts
-                    b = b""
                 else:
-                    self.logger.warning(f"Messaggio con formato errato: {parts}")
+                    self.logger.warning("Messaggio con formato errato: %s", parts)
                     continue
-                
+
                 client_id_str = self._get_client_id_str(client_id)
-                
-                # Aggiorna subito l'heartbeat
                 self.heartbeats[client_id] = time.time()
                 try:
-                    msg_str = message.decode('utf-8', errors='replace') if isinstance(message, bytes) else message
+                    msg_str = message.decode("utf-8", errors="replace") if isinstance(message, bytes) else message
                     msg_str = msg_str.strip()
-                    self.logger.debug(f"Messaggio UTF-8 da {client_id_str} decodificato {msg_str}")
-                except Exception as e:
+                except Exception:
                     msg_str = f"BINARY_DATA[{len(message)}]"
-                    self.logger.debug(f"Messaggio binario da {client_id_str} decodificato {msg_str}")
-                
-                if msg_str.upper() == 'HEARTBEAT':
-                    self.logger.debug(f"Heartbeat da {client_id_str}")
+
+                if msg_str.upper() == "HEARTBEAT":
                     self.router.send_multipart([client_id, b"", b"PONG"])
-                
-                elif msg_str.startswith("MIN:") or message.startswith(b"SUB:"): #retro compatibilità
-                    symbol = msg_str.split(':')[1] if ':' in msg_str else 'UNKNOWN'
+                elif msg_str.startswith("MIN:") or message.startswith(b"SUB:"):
+                    symbol = msg_str.split(":", 1)[1] if ":" in msg_str else "UNKNOWN"
                     self._add_subscription(client_id, symbol)
                     self.router.send_multipart([client_id, b"", b"ACK"])
-                    self.logger.info(f"Sottoscrizione intraday {symbol} da {client_id_str}")
-
+                    self.logger.info("Sottoscrizione intraday %s da %s", symbol, client_id_str)
                 elif msg_str.startswith("MIN_CRYPTO:"):
                     symbol = msg_str.split(":", 1)[1] if ":" in msg_str else "UNKNOWN"
-                    self._add_subscription(client_id, symbol, asset_class='crypto')
+                    self._add_subscription(client_id, symbol, asset_class="crypto")
                     self.router.send_multipart([client_id, b"", b"ACK-CRYPTO"])
-                    self.logger.info(f"Sottoscrizione intraday crypto {symbol} da {client_id_str}")
-
+                    self.logger.info("Sottoscrizione intraday crypto %s da %s", symbol, client_id_str)
                 elif msg_str.startswith("DAY_CRYPTO:"):
                     self.router.send_multipart([client_id, b"", b"ERR:DAY_CRYPTO_NOT_SUPPORTED"])
-                    self.logger.warning(f"Richiesta DAY_CRYPTO non supportata da {client_id_str}")
-                
+                    self.logger.warning("Richiesta DAY_CRYPTO non supportata da %s", client_id_str)
                 elif msg_str.startswith("DAY:"):
-                    symbol = msg_str.split(':')[1] if ':' in msg_str else 'UNKNOWN'
-                    self._add_subscription(client_id, symbol, timeframe='daily')
+                    symbol = msg_str.split(":", 1)[1] if ":" in msg_str else "UNKNOWN"
+                    self._add_subscription(client_id, symbol, timeframe="daily")
                     self.router.send_multipart([client_id, b"", b"ACK-DAILY"])
-                    self.logger.info(f"Sottoscrizione giornaliera {symbol} da {client_id_str}")
-
+                    self.logger.info("Sottoscrizione giornaliera %s da %s", symbol, client_id_str)
                 elif msg_str == "DISCONNECT":
                     self._safe_remove_client(client_id)
                     self.router.send_multipart([client_id, b"", b"BYE"])
-                    self.logger.info(f"Disconnessione pulita {client_id_str}")
+                    self.logger.info("Disconnessione pulita %s", client_id_str)
                 elif msg_str.startswith("HISTORICAL:") or msg_str.startswith("HISTORICAL|"):
                     payload = self._handle_historical_request(msg_str)
                     self.router.send_multipart([client_id, b"", pickle.dumps(payload)])
                 else:
-                    self.logger.warning(f"----Messaggio non riconosciuto da {client_id_str}: {msg_str[:100]}")
-            except zmq.ZMQError as e:
-                self.logger.error(f"Errore ZMQ: {e}", exc_info=True)
-                time.sleep(1)
-            except Exception as e:
-                self.logger.error(f"Errore generico: {e}", exc_info=True)
+                    self.logger.warning("Messaggio non riconosciuto da %s: %s", client_id_str, msg_str[:100])
+            except Exception as exc:
+                self.logger.error("Errore generico: %s", exc, exc_info=True)
 
     def _parse_proxy_datetime(self, value):
         if value.endswith("Z"):
@@ -465,7 +438,6 @@ class AlpacaSmartProxy:
 
     def _handle_historical_request(self, msg_str):
         try:
-            # Nuovo formato: HISTORICAL|asset|symbol|timeframe|from|to|limit
             if "|" in msg_str:
                 parts = msg_str.split("|")
                 if len(parts) != 7 or parts[0] != "HISTORICAL":
@@ -473,7 +445,6 @@ class AlpacaSmartProxy:
                 _, asset_class, symbol, timeframe, fromdate, todate, limit = parts
                 limit = int(limit)
             else:
-                # Retro-compatibilità con vecchio formato stock
                 _, symbol, timeframe, fromdate, todate = msg_str.split(":")
                 asset_class = "stock"
                 limit = 1000
@@ -487,143 +458,136 @@ class AlpacaSmartProxy:
                 asset_class=asset_class,
             )
             return {"ok": True, "df": df}
-        except Exception as e:
-            emsg = str(e)
+        except Exception as exc:
+            emsg = str(exc)
             if "401" in emsg and "Authorization" in emsg:
                 emsg = (
                     "401 Authorization Required su storico Alpaca dal proxy. "
                     "Verifica chiavi del processo proxy (ALPACA_API_KEY/ALPACA_SECRET_KEY "
                     "o ALPACA_KEY/ALPACA_SECRET)."
                 )
-            self.logger.error(f"Errore richiesta storico proxy: {emsg}")
+            self.logger.error("Errore richiesta storico proxy: %s", emsg)
             return {"ok": False, "error": emsg, "df": None}
 
     def start(self):
-        """Avvia il servizio proxy"""
-        self.logger.info("Avvio proxy Alpaca...")
+        self.logger.info("Avvio proxy Alpaca control plane...")
         self.running = True
-        # Resetta l'eventuale stato precedente (es. riavvii consecutivi)
-        self._stream_ready_event.clear()
-        
+        self.monitor.start()
+        self._start_worker()
         try:
             self.cleanup_thread = threading.Thread(target=self._cleanup_dead_clients, daemon=True)
             self.cleanup_thread.start()
-            
-            client_thread = threading.Thread(target=self._handle_client_messages, daemon=True)
-            client_thread.start()
-            
-            self.logger.info("Proxy pronto. In attesa di connessioni...")
-            self.logger.debug("In attesa della prima sottoscrizione prima di avviare lo stream Alpaca...")
-            while self.running:
-                if self._stream_ready_event.wait(timeout=5):
-                    break
-                self.logger.debug("Idle: nessun simbolo sottoscritto, attendo... (ancora in ascolto)")
 
-            if not self.running:
-                self.logger.info("Arresto richiesto prima dell'avvio dello stream Alpaca")
-                return
+            self.client_thread = threading.Thread(target=self._handle_client_messages, daemon=True)
+            self.client_thread.start()
 
-            self.logger.info("Prima sottoscrizione ricevuta: avvio stream Alpaca stock+crypto")
-            stock_thread = threading.Thread(target=self.alpaca_stream.run, daemon=True)
-            crypto_thread = threading.Thread(target=self.alpaca_crypto_stream.run, daemon=True)
-            stock_thread.start()
-            crypto_thread.start()
+            self.worker_event_thread = threading.Thread(target=self._handle_worker_events, daemon=True)
+            self.worker_event_thread.start()
+
+            self.logger.info(
+                "Proxy pronto. Control plane attivo su %s / %s",
+                self.router_bind,
+                self.pub_bind,
+            )
             while self.running:
+                if self.worker_process and self.worker_process.poll() is not None:
+                    raise RuntimeError(f"Worker Alpaca terminato con codice {self.worker_process.returncode}")
                 time.sleep(1)
-            
-        except Exception as e:
-            self.logger.critical(f"Errore durante l'avvio: {e}")
-            self.stop()
+            if self._requested_stop_reason and not self._stopping:
+                self.stop(eod_reason=self._requested_stop_reason)
+        except Exception as exc:
+            self.logger.critical("Errore durante l'avvio: %s", exc, exc_info=True)
+            self.stop(eod_reason="proxy_error")
             raise
 
     def stop(self, eod_reason="proxy_stop"):
-        """Arresta il servizio proxy"""
         if self._stopping:
             self.logger.info("stop() già in corso, ignoro chiamata duplicata")
             return
         self._stopping = True
         self.logger.info("Arresto proxy in corso...")
         self.running = False
-        # Garantisci che eventuali thread in attesa vengano sbloccati
-        self._stream_ready_event.set()
 
-        # Nuovo comportamento: invia sempre EOD allo stop del proxy
-        # per consentire shutdown ordinato dei consumer.
         try:
             self._broadcast_eod(reason=eod_reason)
-            time.sleep(0.5)  # breve finestra per consentire consegna ai subscriber
-        except Exception as e:
-            self.logger.warning(f"EOD broadcast fallito in stop(): {e}")
-        
+            time.sleep(0.5)
+        except Exception as exc:
+            self.logger.warning("EOD broadcast fallito in stop(): %s", exc)
+
+        for thread in [self.cleanup_thread, self.client_thread, self.worker_event_thread]:
+            if thread:
+                thread.join(timeout=5)
+
         try:
-            if self.cleanup_thread:
-                self.cleanup_thread.join(timeout=5)
-            
-            # Disconnessione pulita da Alpaca (intraday)
-            for symbol in list(self.active_alpaca_symbols):
-                try:
-                    self.alpaca_stream.unsubscribe_bars(symbol)
-                    self.logger.info(f"Disconnesso da {symbol} su Alpaca")
-                except Exception as e:
-                    self.logger.error(f"Errore disconnessione {symbol}: {e}")
-            for symbol in list(self.active_alpaca_crypto_symbols):
-                try:
-                    self.alpaca_crypto_stream.unsubscribe_bars(symbol)
-                    self.logger.info(f"Disconnesso da {symbol} (crypto) su Alpaca")
-                except Exception as e:
-                    self.logger.error(f"Errore disconnessione crypto {symbol}: {e}")
-
-            # Disconnessione pulita da Alpaca (daily)
-            for symbol in list(self.active_alpaca_daily_symbols):
-                try:
-                    self.alpaca_stream.unsubscribe_daily_bars(symbol)
-                    self.logger.info(f"Disconnesso da {symbol} (daily) su Alpaca")
-                except Exception as e:
-                    self.logger.error(f"Errore disconnessione daily {symbol}: {e}")
-
-            self.alpaca_stream.stop_ws()
-            self.alpaca_crypto_stream.stop_ws()
-
-            self.context.destroy()
+            self._stop_worker()
+        finally:
+            self.monitor.stop()
+            self.worker_command_socket.close(0)
+            self.worker_event_socket.close(0)
+            self.router.close(0)
+            self.publisher.close(0)
+            self.context.term()
             self.logger.info("Proxy arrestato correttamente")
-            
-        except Exception as e:
-            self.logger.critical(f"Errore durante l'arresto: {e}")
-            raise
+
 
 if __name__ == "__main__":
-    import argparse
-    import signal as _signal
-
     parser = argparse.ArgumentParser()
-    parser.add_argument('--log-level', default='INFO',
-                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
-                       help='Livello di logging')
-
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Livello di logging",
+    )
+    parser.add_argument(
+        "--router-bind",
+        default="tcp://*:5555",
+        help="Endpoint pubblico ROUTER",
+    )
+    parser.add_argument(
+        "--pub-bind",
+        default="tcp://*:5556",
+        help="Endpoint pubblico PUB",
+    )
+    parser.add_argument(
+        "--worker-cmd-endpoint",
+        default="tcp://127.0.0.1:5560",
+        help="Endpoint interno A->B per comandi",
+    )
+    parser.add_argument(
+        "--worker-event-endpoint",
+        default="tcp://127.0.0.1:5561",
+        help="Endpoint interno B->A per eventi",
+    )
+    parser.add_argument(
+        "--monitor-seconds",
+        type=float,
+        default=0.0,
+        help="Intervallo monitor processi; 0 disabilita",
+    )
     args = parser.parse_args()
 
     log_level = getattr(logging, args.log_level)
-    proxy = AlpacaSmartProxy(log_level)
+    proxy = AlpacaSmartProxy(
+        log_level=log_level,
+        router_bind=args.router_bind,
+        pub_bind=args.pub_bind,
+        cmd_endpoint=args.worker_cmd_endpoint,
+        event_endpoint=args.worker_event_endpoint,
+        monitor_seconds=args.monitor_seconds,
+    )
 
     def _handle_sigusr1(signum, frame):
-        """
-        SIGUSR1 = segnale di fine giornata controllata.
-        Invia EOD a tutti i client e poi si ferma.
-
-        Uso:
-            systemctl --user kill -s USR1 zmq-proxy
-            # oppure:
-            kill -USR1 <pid>
-        """
+        del signum, frame
         proxy.logger.info("SIGUSR1: invio EOD ai client e arresto controllato...")
-        proxy.stop(eod_reason="eod_manual")
+        proxy.request_stop(reason="eod_manual")
 
     _signal.signal(_signal.SIGUSR1, _handle_sigusr1)
 
     def _handle_stop_signal(signum, frame):
+        del frame
         sname = _signal.Signals(signum).name
-        proxy.logger.info(f"Segnale {sname} ricevuto: stop proxy con EOD")
-        proxy.stop(eod_reason="proxy_stop")
+        proxy.logger.info("Segnale %s ricevuto: stop proxy con EOD", sname)
+        proxy.request_stop(reason="proxy_stop")
 
     _signal.signal(_signal.SIGTERM, _handle_stop_signal)
     _signal.signal(_signal.SIGINT, _handle_stop_signal)
@@ -633,6 +597,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         proxy.logger.info("Ricevuto CTRL+C, arresto...")
         proxy.stop(eod_reason="proxy_stop")
-    except Exception as e:
-        proxy.logger.critical(f"Errore irreversibile: {e}")
+    except Exception as exc:
+        proxy.logger.critical("Errore irreversibile: %s", exc, exc_info=True)
         proxy.stop(eod_reason="proxy_error")
