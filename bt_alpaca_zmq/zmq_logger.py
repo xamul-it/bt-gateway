@@ -19,7 +19,10 @@ ZMQ_SERVER_ADDR = (
 )
 
 # Configurazione logging
-OUTPUT_DIR = Path("out") / "dump"
+# Default coerente con la documentazione del repo: /home/htpc/backtrader/out/dump
+# È possibile fare override con ZMQ_LOG_OUTPUT_DIR.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_DIR = Path(os.environ.get("ZMQ_LOG_OUTPUT_DIR", REPO_ROOT / "out" / "dump"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = OUTPUT_DIR / "zmq_messages.log"
 logging.basicConfig(
