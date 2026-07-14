@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import json
 import logging
 import os
 import pickle
@@ -22,6 +23,7 @@ from process_monitor import ProcessMonitor
 API_KEY = os.environ.get("ALPACA_API_KEY") or os.environ.get("ALPACA_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("ALPACA_SECRET")
 FEED = os.environ.get("ALPACA_DATA_FEED", "sip")
+HEARTBEAT_TIMEOUT_S = int(os.environ.get("ZMQ_PROXY_HEARTBEAT_TIMEOUT_S", "30"))
 
 if not API_KEY or not SECRET_KEY:
     raise RuntimeError(
@@ -76,6 +78,9 @@ class AlpacaSmartProxy:
         self.client_daily_assets = defaultdict(set)
         self.daily_asset_subscribers = defaultdict(set)
         self.active_alpaca_daily_symbols = set()
+        self.client_quote_assets = defaultdict(set)
+        self.quote_asset_subscribers = defaultdict(set)
+        self.active_alpaca_quote_symbols = set()
 
         if FEED == "sip":
             data_feed = DataFeed.SIP
@@ -117,7 +122,14 @@ class AlpacaSmartProxy:
             "clients": len(self.heartbeats),
             "intraday_syms": len(self.active_alpaca_symbols) + len(self.active_alpaca_crypto_symbols),
             "daily_syms": len(self.active_alpaca_daily_symbols),
+            "quote_syms": len(self.active_alpaca_quote_symbols),
             "worker_pid": self.worker_process.pid if self.worker_process else "na",
+        }
+
+    def _client_config(self):
+        return {
+            "heartbeat_timeout_s": HEARTBEAT_TIMEOUT_S,
+            "recommended_heartbeat_s": max(1, HEARTBEAT_TIMEOUT_S // 2),
         }
 
     def _broadcast_eod(self, reason="proxy_stop"):
@@ -225,7 +237,14 @@ class AlpacaSmartProxy:
                     self.active_alpaca_daily_symbols.discard(symbol)
                     self.logger.info("Rimosso simbolo giornaliero %s (nessun client)", symbol)
 
-            for registry in [self.client_assets, self.client_daily_assets, self.heartbeats]:
+            for symbol in list(self.client_quote_assets.get(client_id, set())):
+                self.quote_asset_subscribers[symbol].discard(client_id)
+                if not self.quote_asset_subscribers[symbol]:
+                    self._send_worker_command("unsubscribe", symbol=symbol, timeframe="quote", asset_class="stock")
+                    self.active_alpaca_quote_symbols.discard(symbol)
+                    self.logger.info("Rimosso simbolo quote %s (nessun client)", symbol)
+
+            for registry in [self.client_assets, self.client_daily_assets, self.client_quote_assets, self.heartbeats]:
                 if client_id in registry:
                     del registry[client_id]
 
@@ -244,6 +263,14 @@ class AlpacaSmartProxy:
                 subscribers = self.daily_asset_subscribers
                 active_symbols = self.active_alpaca_daily_symbols
                 sub_type = "daily"
+            elif timeframe == "quote":
+                if is_crypto:
+                    raise ValueError("Sottoscrizione quote crypto non supportata in questo proxy")
+                prev_count = len(self.quote_asset_subscribers.get(symbol, set()))
+                registry = self.client_quote_assets
+                subscribers = self.quote_asset_subscribers
+                active_symbols = self.active_alpaca_quote_symbols
+                sub_type = "quote"
             else:
                 prev_count = len(self.asset_subscribers.get(symbol, set()))
                 registry = self.client_assets
@@ -263,7 +290,7 @@ class AlpacaSmartProxy:
             )
 
             if prev_count == 0 and symbol not in active_symbols:
-                worker_timeframe = "daily" if timeframe == "daily" else "minute"
+                worker_timeframe = "daily" if timeframe == "daily" else "quote" if timeframe == "quote" else "minute"
                 self._send_worker_command(
                     "subscribe",
                     symbol=symbol,
@@ -285,19 +312,21 @@ class AlpacaSmartProxy:
                     total_clients = len(self.heartbeats)
                     total_intraday = len(self.active_alpaca_symbols) + len(self.active_alpaca_crypto_symbols)
                     total_daily = len(self.active_alpaca_daily_symbols)
-                    total_symbols = total_intraday + total_daily
+                    total_quote = len(self.active_alpaca_quote_symbols)
+                    total_symbols = total_intraday + total_daily + total_quote
                     self.logger.info(
-                        "Alive: %s client, %s intraday + %s daily = %s titoli",
+                        "Alive: %s client, %s intraday + %s daily + %s quote = %s titoli",
                         total_clients,
                         total_intraday,
                         total_daily,
+                        total_quote,
                         total_symbols,
                     )
                     self._last_alive_log = now
                 dead_clients = [
                     client_id
                     for client_id, last_hb in list(self.heartbeats.items())
-                    if now - last_hb > 30
+                    if now - last_hb > HEARTBEAT_TIMEOUT_S
                 ]
                 for client_id in dead_clients:
                     self.logger.warning(
@@ -376,6 +405,20 @@ class AlpacaSmartProxy:
                     self._add_subscription(client_id, symbol, timeframe="daily")
                     self.router.send_multipart([client_id, b"", b"ACK-DAILY"])
                     self.logger.info("Sottoscrizione giornaliera %s da %s", symbol, client_id_str)
+                elif msg_str.startswith("QUOTE:"):
+                    symbol = msg_str.split(":", 1)[1] if ":" in msg_str else "UNKNOWN"
+                    self._add_subscription(client_id, symbol, timeframe="quote")
+                    self.router.send_multipart([client_id, b"", b"ACK-QUOTE"])
+                    self.logger.info("Sottoscrizione quote %s da %s", symbol, client_id_str)
+                elif msg_str.startswith("QUOTE_META:"):
+                    symbol = msg_str.split(":", 1)[1] if ":" in msg_str else "UNKNOWN"
+                    self._add_subscription(client_id, symbol, timeframe="quote")
+                    metadata = json.dumps(self._client_config()).encode("utf-8")
+                    self.router.send_multipart([client_id, b"", b"ACK-QUOTE", metadata])
+                    self.logger.info("Sottoscrizione quote %s da %s (metadata)", symbol, client_id_str)
+                elif msg_str.upper() in {"CONFIG", "HELLO"}:
+                    metadata = json.dumps(self._client_config()).encode("utf-8")
+                    self.router.send_multipart([client_id, b"", b"CONFIG", metadata])
                 elif msg_str == "DISCONNECT":
                     self._safe_remove_client(client_id)
                     self.router.send_multipart([client_id, b"", b"BYE"])

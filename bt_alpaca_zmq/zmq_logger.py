@@ -59,10 +59,29 @@ def _build_log_entry(message: Dict[str, Any]) -> Dict[str, Any]:
     """Prepara una riga pronta per essere salvata (formato flat msgpack)."""
     recv_ts = datetime.now(timezone.utc).isoformat()
     symbol = message.get("symbol") or "UNKNOWN"
+    if message.get("type") == "quote":
+        return {
+            "recv_ts":      recv_ts,
+            "proxy_ts":     _format_epoch(message.get("proxy_ts")),
+            "timeframe":    "quote",
+            "event_type":   "quote",
+            "symbol":       symbol,
+            "timestamp":    message.get("ts"),
+            "bid_price":    message.get("bid_price"),
+            "ask_price":    message.get("ask_price"),
+            "bid_size":     message.get("bid_size"),
+            "ask_size":     message.get("ask_size"),
+            "bid_exchange": message.get("bid_exchange"),
+            "ask_exchange": message.get("ask_exchange"),
+            "mid":          message.get("mid"),
+            "spread":       message.get("spread"),
+            "spread_bps":   message.get("spread_bps"),
+        }
     return {
         "recv_ts":     recv_ts,
         "proxy_ts":    _format_epoch(message.get("proxy_ts")),
         "timeframe":   "daily" if message.get("daily") else "intraday",
+        "event_type":  message.get("type", "bar"),
         "symbol":      symbol,
         "timestamp":   message.get("ts"),
         "open":        message.get("open"),
