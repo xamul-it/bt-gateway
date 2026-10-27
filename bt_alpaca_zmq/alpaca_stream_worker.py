@@ -56,6 +56,7 @@ class AlpacaStreamWorker:
         self.active_alpaca_crypto_symbols = set()
         self.active_alpaca_daily_symbols = set()
         self.active_alpaca_quote_symbols = set()
+        self.active_alpaca_trade_symbols = set()
 
     def _build_stock_stream(self):
         return StockDataStream(API_KEY, SECRET_KEY, feed=self.data_feed)
@@ -120,6 +121,21 @@ class AlpacaStreamWorker:
 
     async def _alpaca_quote_callback(self, quote):
         await self._on_quote(quote)
+
+    async def _alpaca_trade_callback(self, trade):
+        try:
+            ts = trade.timestamp
+            payload = {
+                "type": "trade", "symbol": trade.symbol, "asset_class": "stock",
+                "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "price": float(trade.price), "size": float(trade.size),
+                "exchange": str(trade.exchange or ""), "trade_id": str(trade.id),
+                "conditions": list(trade.conditions or []), "feed": self.data_feed.value,
+                "tape": str(trade.tape or ""), "proxy_ts": time.time(),
+            }
+            self.event_socket.send_multipart([trade.symbol.encode(), msgpack.packb(payload, use_bin_type=True)])
+        except Exception as exc:
+            self.logger.error("Errore invio trade a control plane: %s", exc, exc_info=True)
 
     async def _alpaca_crypto_callback(self, bar):
         await self._on_bar(bar, daily=False, asset_class="crypto")
@@ -198,6 +214,9 @@ class AlpacaStreamWorker:
                 "ask_size": float(quote.ask_size) if quote.ask_size is not None else 0.0,
                 "bid_exchange": str(quote.bid_exchange or ""),
                 "ask_exchange": str(quote.ask_exchange or ""),
+                "conditions": list(getattr(quote, "conditions", None) or []),
+                "tape": str(getattr(quote, "tape", None) or ""),
+                "feed": self.data_feed.value,
                 "mid": mid,
                 "spread": spread,
                 "spread_bps": (spread / mid * 10000.0) if mid > 0 else 0.0,
@@ -223,6 +242,18 @@ class AlpacaStreamWorker:
             self.active_alpaca_quote_symbols.add(symbol)
             self._ensure_streams_started(asset_class="stock", timeframe="quote")
             self.logger.info("Worker subscribed quote %s", symbol)
+            return
+
+        if timeframe == "trade":
+            if asset_class != "stock":
+                self.logger.warning("Quote non supportate per asset_class=%s symbol=%s", asset_class, symbol)
+                return
+            if symbol in self.active_alpaca_trade_symbols:
+                return
+            self.alpaca_stream.subscribe_trades(self._alpaca_trade_callback, symbol)
+            self.active_alpaca_trade_symbols.add(symbol)
+            self._ensure_streams_started(asset_class="stock", timeframe="trade")
+            self.logger.info("Worker subscribed trade %s", symbol)
             return
 
         if timeframe == "daily":
@@ -257,7 +288,16 @@ class AlpacaStreamWorker:
                     self.alpaca_stream.unsubscribe_quotes(symbol)
                     self.active_alpaca_quote_symbols.discard(symbol)
                     self.logger.info("Worker unsubscribed quote %s", symbol)
-                    if not self.active_alpaca_quote_symbols and not self.active_alpaca_symbols and not self.active_alpaca_daily_symbols:
+                    if not self.active_alpaca_quote_symbols and not self.active_alpaca_symbols and not self.active_alpaca_daily_symbols and not self.active_alpaca_trade_symbols:
+                        self._reset_stock_stream()
+                return
+
+            if timeframe == "trade":
+                if symbol in self.active_alpaca_trade_symbols:
+                    self.alpaca_stream.unsubscribe_trades(symbol)
+                    self.active_alpaca_trade_symbols.discard(symbol)
+                    self.logger.info("Worker unsubscribed trade %s", symbol)
+                    if not self.active_alpaca_trade_symbols and not self.active_alpaca_symbols and not self.active_alpaca_daily_symbols and not self.active_alpaca_quote_symbols:
                         self._reset_stock_stream()
                 return
 
@@ -266,7 +306,7 @@ class AlpacaStreamWorker:
                     self.alpaca_stream.unsubscribe_daily_bars(symbol)
                     self.active_alpaca_daily_symbols.discard(symbol)
                     self.logger.info("Worker unsubscribed daily %s", symbol)
-                    if not self.active_alpaca_daily_symbols and not self.active_alpaca_symbols and not self.active_alpaca_quote_symbols:
+                    if not self.active_alpaca_daily_symbols and not self.active_alpaca_symbols and not self.active_alpaca_quote_symbols and not self.active_alpaca_trade_symbols:
                         self._reset_stock_stream()
                 return
 
@@ -283,7 +323,7 @@ class AlpacaStreamWorker:
                 self.alpaca_stream.unsubscribe_bars(symbol)
                 self.active_alpaca_symbols.discard(symbol)
                 self.logger.info("Worker unsubscribed stock %s", symbol)
-                if not self.active_alpaca_symbols and not self.active_alpaca_daily_symbols and not self.active_alpaca_quote_symbols:
+                if not self.active_alpaca_symbols and not self.active_alpaca_daily_symbols and not self.active_alpaca_quote_symbols and not self.active_alpaca_trade_symbols:
                     self._reset_stock_stream()
         except Exception as exc:
             self.logger.error("Errore unsubscribe %s (%s/%s): %s", symbol, timeframe, asset_class, exc)
@@ -339,6 +379,9 @@ class AlpacaStreamWorker:
             self._unsubscribe(symbol=symbol, timeframe="daily", asset_class="stock")
         for symbol in list(self.active_alpaca_quote_symbols):
             self._unsubscribe(symbol=symbol, timeframe="quote", asset_class="stock")
+
+        for symbol in list(self.active_alpaca_trade_symbols):
+            self._unsubscribe(symbol=symbol, timeframe="trade", asset_class="stock")
 
         if self.stock_stream_started:
             self._reset_stock_stream()

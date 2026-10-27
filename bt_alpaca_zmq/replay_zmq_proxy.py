@@ -1,695 +1,475 @@
 #!/usr/bin/env python3
+"""Replay degli archivi ZMQ su porte separate, senza accesso a broker o Alpaca.
+
+REQ 5557 / PUB 5558, loopback per default. Il primo client avvia il clock.
+MIN, QUOTE e TRADE richiedono dati presenti; SUBSCRIBE registra più canali
+atomicamente. Speed 1 conserva gli intervalli, 60 li divide per 60, 0=max.
+I timestamp originali sono conservati; --remap-today è una scelta esplicita.
 """
-Replay ZMQ Proxy
-================
-Riproduce giornate di trading da file di log (output di zmq_logger.py).
-Interfaccia ZMQ compatibile con AlpacaSmartProxy, su porte separate.
-
-Comportamento:
-  - Porte default: REQ/REP=5557, PUB/SUB=5558 (configurabile)
-  - Al primo client → replay parte dall'apertura mercato (14:30 UTC = 09:30 EST)
-  - Speed: 1.0 = real-time, 10.0 = 10x più veloce, 0 = massima velocità
-  - No clients → reset (prossimo client riparte da tick 0)
-  - Late-join symbol → fast-forward al clock corrente
-  - HISTORICAL request → risponde con bar dai log file (no Alpaca REST)
-  - Fine giornata → broadcast segnale EOD a tutti i client
-
-Uso:
-  python replay_zmq_proxy.py --date 2026-01-12 --speed 60
-
-Per usarlo con btmain.py:
-  export PROXY_ADDR=tcp://localhost:5557
-  export proxy_pub_addr=tcp://localhost:5558
-  python btmain.py --mode backtest --provider alpaca --alpaca-mode proxy ...
-"""
-
-import sys
-import zmq
-import msgpack
-import threading
-import time
-import json
-import pickle
-import logging
 import argparse
-from datetime import date, datetime, timezone
+from collections import deque
+from datetime import date, datetime, time as day_time, timedelta, timezone
+import json
+import logging
+import math
+import os
 from pathlib import Path
-from collections import defaultdict
+import pickle
+import re
+import signal
+import sqlite3
+import tempfile
+import time
+from zoneinfo import ZoneInfo
+
+import msgpack
 import pandas as pd
+import zmq
 
 
-# ---------------------------------------------------------------------------
-# Market hours (UTC)
-# ---------------------------------------------------------------------------
-MARKET_OPEN_UTC  = (14, 30)   # 09:30 EST = 14:30 UTC
-MARKET_CLOSE_UTC = (21, 0)    # 16:00 EST = 21:00 UTC
+ROOT = Path(__file__).resolve().parents[2]
+CHANNELS = {'minute', 'quote', 'trade'}
 
 
-# ---------------------------------------------------------------------------
-# ReplayProxy
-# ---------------------------------------------------------------------------
+def parse_timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError('Timestamp mancante')
+    dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    fraction = re.search(r':\d{2}\.(\d+)', value)
+    nanos = int(fraction.group(1)[:9].ljust(9, '0')) if fraction else 0
+    return dt, int(dt.replace(microsecond=0).timestamp()) * 1_000_000_000 + nanos
+
+
 class ReplayProxy:
     DEFAULT_REQ_PORT = 5557
     DEFAULT_PUB_PORT = 5558
-    HEARTBEAT_TIMEOUT = 60   # secondi prima di considerare un client morto
+    HEARTBEAT_TIMEOUT = 60
 
-    def __init__(self, replay_date: date, speed: float, log_dir: str,
-                 req_port: int, pub_port: int, log_level=logging.INFO):
-        self.replay_date = replay_date
-        # Delta giorni per il remapping: sposta ogni timestamp a oggi
-        self._date_delta = date.today() - replay_date
-        self.speed       = speed        # 0 = max, else 60/speed secondi per bar
-        self.log_dir     = Path(log_dir)
-        self.req_port    = req_port
-        self.pub_port    = pub_port
-
-        self._setup_logging(log_level)
+    def __init__(self, replay_date, speed, log_dir, req_port=5557, pub_port=5558,
+                 log_level=logging.INFO, symbols=None, session='all', status_file=None,
+                 remap_today=False, parent_pid=None):
+        if not math.isfinite(speed) or speed < 0:
+            raise ValueError('Velocità non valida')
+        if req_port == pub_port or req_port in (5555, 5556) or pub_port in (5555, 5556):
+            raise ValueError('Usa porte separate dal proxy live')
+        if session not in ('all', 'rth', 'ah'):
+            raise ValueError('Sessione non valida')
+        self.replay_date, self.speed, self.log_dir = replay_date, speed, Path(log_dir)
+        self.req_port, self.pub_port = req_port, pub_port
+        self.symbols = symbols
+        self.session, self.status_file = session, Path(status_file) if status_file else None
+        self.parent_pid = parent_pid
+        self.remap_today = remap_today
+        today = datetime.now(ZoneInfo('America/New_York')).date()
+        self.date_delta = timedelta(days=(today - replay_date).days) if remap_today else timedelta(0)
+        ny = ZoneInfo('America/New_York')
+        start_hour, end_hour = {'all': (0, 24), 'rth': (9.5, 16), 'ah': (16, 20)}[session]
+        self.session_start = datetime.combine(replay_date, day_time(int(start_hour), int(start_hour % 1 * 60)), ny)
+        self.session_end = (datetime.combine(replay_date + timedelta(days=1), day_time(0), ny) if end_hour == 24
+                    else datetime.combine(replay_date, day_time(end_hour), ny))
         self.logger = logging.getLogger('ReplayProxy')
-
-        # ZMQ
-        self.context   = zmq.Context()
-        self.router    = self.context.socket(zmq.ROUTER)
+        self.logger.setLevel(log_level)
+        self.context = zmq.Context()
+        self.router = self.context.socket(zmq.ROUTER)
         self.router.setsockopt(zmq.ROUTER_HANDOVER, 1)
-        self.router.setsockopt(zmq.RCVTIMEO, 500)   # 500ms timeout su recv
-        self.router.bind(f"tcp://*:{req_port}")
+        self.router.setsockopt(zmq.LINGER, 0)
         self.publisher = self.context.socket(zmq.PUB)
-        self.publisher.bind(f"tcp://*:{pub_port}")
+        self.publisher.setsockopt(zmq.LINGER, 0)
+        self.router.bind(f'tcp://127.0.0.1:{req_port}')
+        self.publisher.bind(f'tcp://127.0.0.1:{pub_port}')
+        self.temporary = tempfile.TemporaryDirectory(prefix='bt-replay-')
+        self.db = sqlite3.connect(str(Path(self.temporary.name) / 'events.sqlite'))
+        self.db.execute('PRAGMA journal_mode=OFF')
+        self.db.execute('PRAGMA cache_size=-8192')
+        self.db.execute('CREATE TABLE events (id INTEGER PRIMARY KEY, ns INTEGER, symbol TEXT, channel TEXT, payload TEXT)')
+        self.db.execute('CREATE TABLE history (id INTEGER PRIMARY KEY, ns INTEGER, symbol TEXT, payload TEXT)')
+        self.available = {}
+        self.clients, self.names, self.heartbeats = {}, {}, {}
+        self.state, self.error, self.loading_symbol = 'PREPARING', None, None
+        self.invalid_lines, self.scanned_bytes, self.total_events = 0, 0, 0
+        self.published, self.sequence, self.generation = 0, 0, 0
+        self.recent = deque(maxlen=500)
+        self.running = True
+        self.cursor, self.next_event = None, None
+        self.clock_origin_ns, self.wall_origin = 0, 0
+        self.last_status, self.last_cleanup = 0, 0
+        self.preview_requested = False
+        self.preview_generation = 0
+        self.preview_socket = None
+        self.preview_rows = deque(maxlen=500)
+        self._status(force=True)
 
-        # Symbol data
-        # symbol -> {'day': {ts: bar_dict}, 'all': {ts: bar_dict}}
-        self.symbol_bars: dict = {}
-        self.all_ticks: list   = []       # sorted datetimes for replay_date
-        self.market_open_ts: datetime = None
-
-        # State
-        self._state     = 'IDLE'    # IDLE | REPLAYING | EOD_SIGNALED
-        self._clock_idx = 0
-        self._lock      = threading.RLock()
-        self._pub_lock  = threading.Lock()
-
-        # Client management
-        self.clients     = {}   # bytes -> set of symbols
-        self.subscribers = {}   # symbol -> set of client_ids
-        self.heartbeats  = {}   # bytes -> float (last seen)
-
-        # Thread control
-        self._start_event = threading.Event()   # set → replay starts
-        self._reset_event = threading.Event()   # set → abort current replay
-        self._running = True
-
-        self.logger.info(
-            f"ReplayProxy: data={replay_date}, speed={speed}x, "
-            f"log={log_dir}, REQ={req_port}, PUB={pub_port}"
-        )
-
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
-    def _setup_logging(self, log_level):
-        logger = logging.getLogger('ReplayProxy')
-        logger.setLevel(log_level)
-        if not logger.handlers:
-            h = logging.StreamHandler()
-            h.setFormatter(logging.Formatter(
-                '%(asctime)s [%(levelname)s] %(message)s', '%H:%M:%S'
-            ))
-            logger.addHandler(h)
-
-    # ------------------------------------------------------------------
-    # Data loading
-    # ------------------------------------------------------------------
-    def _parse_ts(self, s) -> datetime | None:
-        if not s:
-            return None
-        s = str(s)
-        if s.endswith('Z'):
-            s = s[:-1] + '+00:00'
-        try:
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            return None
+    def _parent_alive(self):
+        return self.parent_pid is None or os.getppid() == self.parent_pid
 
     def load_log_files(self):
-        """
-        Carica tutti i *.json dalla log_dir.
-        Indicizza per symbol e timestamp.
-        Costruisce all_ticks per il replay_date.
-        """
-        tick_set = set()
-        symbols_found = []
-
-        for json_file in sorted(self.log_dir.glob('*.json')):
-            symbol = json_file.stem
-            bars_all = {}
-            bars_day = {}
-
-            with open(json_file) as f:
-                for line in f:
-                    line = line.strip()
+        files = [self.log_dir / f'{s}.json' for s in self.symbols] if self.symbols else sorted(self.log_dir.glob('*.json'))
+        since_status = 0
+        for path in files:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f'Archivio assente o non valido: {path.stem}')
+            symbol = path.stem
+            if not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', symbol):
+                continue
+            self.loading_symbol = symbol
+            history = deque(maxlen=10000)
+            # Freeze the file size: a live recording may continue growing.
+            size = path.stat().st_size
+            with path.open('rb') as handle:
+                while handle.tell() < size:
+                    line = handle.readline(1_000_001)
                     if not line:
+                        break
+                    if handle.tell() > size:
+                        break
+                    if len(line) > 1_000_000:
+                        raise ValueError(f'Riga troppo lunga in {symbol}')
+                    self.scanned_bytes += len(line)
+                    since_status += 1
+                    if since_status >= 2000:
+                        if not self._parent_alive() or not self.running:
+                            raise RuntimeError('Preparazione interrotta')
+                        self.db.commit()
+                        self._status(force=True)
+                        since_status = 0
+                    if not line.endswith(b'\n'):
+                        self.invalid_lines += 1
                         continue
                     try:
                         entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                        if not isinstance(entry, dict):
+                            raise ValueError()
+                        dt, ns = parse_timestamp(entry.get('timestamp'))
+                        kind = entry.get('event_type') or entry.get('type') or entry.get('timeframe', 'bar')
+                        channel = 'quote' if kind == 'quote' else 'trade' if kind == 'trade' else 'minute'
+                        if entry.get('timeframe') == 'daily' or entry.get('daily'):
+                            continue
+                        if channel == 'minute' and not all(entry.get(k) is not None for k in ('open', 'high', 'low', 'close', 'volume')):
+                            raise ValueError()
+                        if channel == 'quote' and not all(entry.get(k) is not None for k in ('bid_price', 'ask_price')):
+                            raise ValueError()
+                        if channel == 'trade' and entry.get('price') is None:
+                            raise ValueError()
+                        entry['symbol'] = symbol
+                        if channel == 'minute' and dt < self.session_start:
+                            history.append((ns, entry))
+                        if not self.session_start <= dt < self.session_end:
+                            continue
+                        self.db.execute('INSERT INTO events(ns,symbol,channel,payload) VALUES(?,?,?,?)',
+                                        (ns, symbol, channel, json.dumps(entry)))
+                        self.available.setdefault(symbol, {}).setdefault(channel, 0)
+                        self.available[symbol][channel] += 1
+                        self.total_events += 1
+                    except (ValueError, TypeError, OverflowError):
+                        self.invalid_lines += 1
+            self.db.executemany('INSERT INTO history(ns,symbol,payload) VALUES(?,?,?)',
+                                ((ns, symbol, json.dumps(entry)) for ns, entry in history))
+        self.db.execute('CREATE INDEX event_clock ON events(ns,id)')
+        self.db.execute('CREATE INDEX history_clock ON history(symbol,ns,id)')
+        self.db.commit()
+        self.loading_symbol = None
+        if not self.total_events:
+            raise ValueError(f'Nessun evento nella sessione {self.session} del {self.replay_date}')
+        self.state = 'IDLE'
+        self._status(force=True)
 
-                    ts = self._parse_ts(entry.get('timestamp'))
-                    if ts is None:
-                        continue
-
-                    bar_dict = {
-                        'timestamp':   ts,
-                        'open':        float(entry.get('open',        0)),
-                        'high':        float(entry.get('high',        0)),
-                        'low':         float(entry.get('low',         0)),
-                        'close':       float(entry.get('close',       0)),
-                        'volume':      float(entry.get('volume',      0)),
-                        'trade_count': float(entry.get('trade_count', 0)),
-                        'vwap':        float(entry.get('vwap',        0)),
-                    }
-                    bars_all[ts] = bar_dict
-
-                    if ts.date() == self.replay_date:
-                        if ts in bars_day:
-                            self.logger.debug(
-                                f"CORRECTION {symbol} {ts.strftime('%H:%M')}: "
-                                f"Alpaca ha inviato barra corretta (close "
-                                f"{bars_day[ts]['close']} → {bar_dict['close']})"
-                            )
-                        bars_day[ts] = bar_dict
-                        tick_set.add(ts)
-
-            if bars_day:
-                self.symbol_bars[symbol] = {'day': bars_day, 'all': bars_all}
-                symbols_found.append(symbol)
-                self.logger.info(f"  {symbol}: {len(bars_day)} bar ({self.replay_date}), "
-                                 f"{len(bars_all)} totali")
-
-        self.all_ticks = sorted(tick_set)
-
-        # market_open_ts = 14:30 UTC del replay_date
-        mo = datetime(
-            self.replay_date.year, self.replay_date.month, self.replay_date.day,
-            MARKET_OPEN_UTC[0], MARKET_OPEN_UTC[1], tzinfo=timezone.utc
-        )
-        self.market_open_ts = mo
-
-        self.logger.info(
-            f"Caricati {len(symbols_found)} simboli, "
-            f"{len(self.all_ticks)} tick per {self.replay_date}"
-        )
-        if self.all_ticks:
-            self.logger.info(f"  Primo: {self.all_ticks[0].isoformat()}")
-            self.logger.info(f"  Ultimo: {self.all_ticks[-1].isoformat()}")
-            warmup_count = sum(1 for t in self.all_ticks if t < mo)
-            trading_count = len(self.all_ticks) - warmup_count
-            self.logger.info(f"  Warmup: {warmup_count} bar | Trading: {trading_count} bar")
-
-        if not self.all_ticks:
-            self.logger.warning(f"Nessun bar trovato per {self.replay_date} in {self.log_dir}")
-
-    # ------------------------------------------------------------------
-    # Timestamp remapping: replay_date → oggi, orario invariato
-    # ------------------------------------------------------------------
-    def _remap_ts(self, ts: datetime) -> datetime:
-        """Trasla il timestamp di _date_delta giorni: porta la data a oggi
-        mantenendo esattamente l'orario e il fuso orario originale.
-        Così la strategia vede barre 'di oggi' e i controlli di orario
-        (trading_start / trading_end) funzionano correttamente."""
-        from datetime import timedelta
-        return ts + timedelta(days=self._date_delta.days)
-
-    # ------------------------------------------------------------------
-    # Publishing
-    # ------------------------------------------------------------------
-    def _publish_bar(self, symbol: str, bar_dict: dict):
-        """Pubblica un bar via PUB. Thread-safe.
-
-        OPT-C/D: flat msgpack message con topic = symbol (per-symbol ZMQ filter).
-        Compatibile con il formato del proxy di produzione.
-        """
-        ts = self._remap_ts(bar_dict['timestamp'])
-        msg = {
-            'type':        'bar',
-            'daily':       False,
-            'asset_class': 'stock',
-            'symbol':      symbol,
-            'ts':          ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
-            'open':        float(bar_dict['open']),
-            'high':        float(bar_dict['high']),
-            'low':         float(bar_dict['low']),
-            'close':       float(bar_dict['close']),
-            'volume':      float(bar_dict['volume']),
-            'trade_count': float(bar_dict.get('trade_count', 0)),
-            'vwap':        float(bar_dict.get('vwap', 0.0)),
-            'proxy_ts':    time.time(),
-        }
-        with self._pub_lock:
-            self.publisher.send_multipart([symbol.encode(), msgpack.packb(msg)])
-
-    def _broadcast_eod(self, reason: str = 'day_complete'):
-        """Invia segnale EOD broadcast a tutti i subscriber."""
-        # OPT-C/D: topic '*' + msgpack flat payload
-        msg = {
-            'type':        'EOD',
-            'daily':       False,
-            'asset_class': 'stock',
-            'symbol':      '*',
-            'ts':          None,
-            'open': 0.0, 'high': 0.0, 'low': 0.0, 'close': 0.0, 'volume': 0.0,
-            'trade_count': 0.0, 'vwap': 0.0,
-            'proxy_ts':    time.time(),
-            'reason':      reason,
-        }
-        with self._pub_lock:
-            self.publisher.send_multipart([b'*', msgpack.packb(msg)])
-        self.logger.info(f"EOD broadcast: {reason}")
-
-    # ------------------------------------------------------------------
-    # Fast-forward per late-joining symbols
-    # ------------------------------------------------------------------
-    def _fast_forward(self, symbol: str):
-        """
-        Invia rapidamente le bar del simbolo dal tick 0 al clock corrente.
-        Chiamato in thread separato dal request handler.
-        """
-        with self._lock:
-            current_idx = self._clock_idx
-
-        sym_data = self.symbol_bars.get(symbol)
-        if not sym_data:
+    def _status(self, force=False):
+        now = time.time()
+        if not force and now - self.last_status < 0.5:
             return
+        self.last_status = now
+        if not self.status_file:
+            return
+        payload = {'pid': os.getpid(), 'updated_at': now, 'state': self.state, 'error': self.error,
+                   'date': self.replay_date.isoformat(), 'session': self.session, 'speed': self.speed,
+                   'req_addr': f'tcp://127.0.0.1:{self.req_port}', 'pub_addr': f'tcp://127.0.0.1:{self.pub_port}',
+                   'timestamp_mode': 'remap_today' if self.remap_today else 'original',
+                   'available': self.available, 'total_events': self.total_events, 'published': self.published,
+                   'loading_symbol': self.loading_symbol, 'scanned_bytes': self.scanned_bytes,
+                   'invalid_lines': self.invalid_lines, 'generation': self.generation,
+                   'clients': [{'id': cid.hex(), 'application': self.names.get(cid, 'Client senza nome'),
+                                'subscriptions': [{'symbol': s, 'channel': c} for s, c in sorted(subs)]}
+                               for cid, subs in self.clients.items()],
+                   'preview': {'active': self.preview_requested, 'generation': self.preview_generation,
+                               'received': self.sequence, 'rows': list(self.preview_rows)}}
+        self.status_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.status_file.with_suffix('.tmp')
+        temporary.write_text(json.dumps(payload))
+        temporary.replace(self.status_file)
 
-        day_bars = sym_data['day']
-        sent = 0
-        for i in range(current_idx):
-            ts = self.all_ticks[i]
-            bar = day_bars.get(ts)
-            if bar:
-                self._publish_bar(symbol, bar)
-                sent += 1
+    def _start_clock(self):
+        self.cursor = self.db.execute('SELECT ns,symbol,channel,payload FROM events ORDER BY ns,id')
+        self.next_event = self.cursor.fetchone()
+        self.state = 'REPLAYING'
+        self.generation += 1
+        self.clock_origin_ns = self.next_event[0]
+        # Allow SUB sockets to complete the subscription handshake before the first event.
+        self.wall_origin = time.monotonic() + 0.3
+        self.published = 0
+        self.recent.clear()
 
-        if sent > 0:
-            self.logger.info(f"{symbol}: fast-forward {sent} bar (fino al tick {current_idx})")
+    def _register(self, client_id, symbols, channels, application=None):
+        if not isinstance(symbols, list) or not symbols or len(symbols) > 20:
+            return b'ERR:INVALID_SYMBOLS'
+        if not isinstance(channels, list) or not channels or any(c not in CHANNELS for c in channels):
+            return b'ERR:UNSUPPORTED_CHANNEL'
+        for symbol in symbols:
+            if not isinstance(symbol, str) or symbol not in self.available:
+                return b'ERR:NO_DATA_FOR_SYMBOL'
+            if any(channel not in self.available[symbol] for channel in channels):
+                return b'ERR:NO_DATA_FOR_CHANNEL'
+        if self.state == 'EOD_SIGNALED':
+            return b'ERR:REPLAY_COMPLETE_DISCONNECT_OR_RESET'
+        self.clients.setdefault(client_id, set()).update((s, c) for s in symbols for c in channels)
+        self.heartbeats[client_id] = time.time()
+        if application:
+            self.names[client_id] = str(application)[:120]
+        if self.state == 'IDLE':
+            self._start_clock()
+        # Late subscribers join the current clock; do not republish history to existing clients.
+        return b'ACK'
 
-    # ------------------------------------------------------------------
-    # Replay loop (thread principale)
-    # ------------------------------------------------------------------
-    def _replay_loop(self):
-        """Thread: gestisce l'intera logica di replay, stato IDLE ↔ REPLAYING."""
-        while self._running:
-            # Attendi che almeno un client si connetta
-            self.logger.info("IDLE — in attesa di client...")
-            self._start_event.wait()
-            if not self._running:
-                break
-            self._start_event.clear()
+    def _remove_client(self, client_id):
+        for registry in (self.clients, self.names, self.heartbeats):
+            registry.pop(client_id, None)
+        if not self.clients:
+            self.state = 'IDLE'
+            self.next_event = None
+            if self.cursor:
+                self.cursor.close()
+                self.cursor = None
 
-            with self._lock:
-                self._state     = 'REPLAYING'
-                self._clock_idx = 0
-
-            self.logger.info(
-                f"REPLAY START — {self.replay_date} | {len(self.all_ticks)} tick | "
-                f"speed={self.speed}x"
-            )
-
-            for i, ts in enumerate(self.all_ticks):
-                if self._reset_event.is_set() or not self._running:
-                    self.logger.info(f"Replay interrotto al tick {i}")
-                    break
-
-                with self._lock:
-                    self._clock_idx = i
-                    active_symbols = list(self.subscribers.keys())
-
-                is_warmup = ts < self.market_open_ts
-
-                # Pubblica bar per tutti i simboli subscribed a questo timestamp
-                for symbol in active_symbols:
-                    sym_data = self.symbol_bars.get(symbol)
-                    if not sym_data:
-                        continue
-                    bar = sym_data['day'].get(ts)
-                    if bar:
-                        self._publish_bar(symbol, bar)
-                    elif not is_warmup:
-                        self.logger.debug(
-                            f"MISSING {symbol} {ts.strftime('%H:%M')}: "
-                            f"nessuna barra Alpaca per questo minuto"
-                        )
-
-                # Log progresso ogni 60 tick
-                if i % 60 == 0:
-                    self.logger.debug(f"Tick {i}/{len(self.all_ticks)} [{ts.strftime('%H:%M')}]"
-                                      f"{' (warmup)' if is_warmup else ''}")
-
-                # Controllo velocità: solo su bar di trading (non warmup)
-                if not is_warmup and self.speed > 0 and not self._reset_event.is_set():
-                    time.sleep(60.0 / self.speed)
-
-            # ----- Fine ciclo -----
-            if not self._reset_event.is_set() and self._running:
-                # Replay completato normalmente
-                self.logger.info("Replay completato. Invio EOD e attendo disconnect client.")
-                with self._lock:
-                    self._state = 'EOD_SIGNALED'
-                self._broadcast_eod('day_complete')
-
-                # Attendi max 120s che i client si disconnettano
-                for _ in range(120):
-                    with self._lock:
-                        if not self.clients:
-                            break
-                    time.sleep(1)
-
-            # ----- Reset -----
-            self._reset_event.clear()
-            with self._lock:
-                self._clock_idx = 0
-                self._state     = 'IDLE'
-                self.clients.clear()
-                self.subscribers.clear()
-                self.heartbeats.clear()
-
-            self.logger.info("Reset completato. Pronto per nuova sessione.")
-
-    # ------------------------------------------------------------------
-    # Client management
-    # ------------------------------------------------------------------
-    def _get_client_id_str(self, client_id) -> str:
-        if isinstance(client_id, bytes):
-            return client_id.hex()[:8]
-        return str(client_id)[:8]
-
-    def _handle_subscribe(self, client_id: bytes, symbol: str, timeframe: str = 'intraday'):
-        """Registra subscription e avvia fast-forward se replay già in corso."""
-        with self._lock:
-            is_first_client = not self.clients
-            already_subscribed = (
-                client_id in self.clients and
-                symbol in self.clients.get(client_id, set())
-            )
-            if already_subscribed:
-                return
-
-            self.clients.setdefault(client_id, set()).add(symbol)
-            self.subscribers.setdefault(symbol, set()).add(client_id)
-            self.heartbeats[client_id] = time.time()
-            state     = self._state
-            clock_idx = self._clock_idx
-
-        cid = self._get_client_id_str(client_id)
-        self.logger.info(f"Subscribe {symbol} da {cid} (state={state})")
-
-        if is_first_client:
-            self.logger.info("Primo client: avvio replay")
-            self._start_event.set()
-        elif state == 'REPLAYING' and clock_idx > 0:
-            # Late joiner: fast-forward in background
-            threading.Thread(
-                target=self._fast_forward,
-                args=(symbol,),
-                daemon=True
-            ).start()
-
-    def _remove_client(self, client_id: bytes):
-        """Rimuove client e triggera reset se è l'ultimo."""
-        cid = self._get_client_id_str(client_id)
-        with self._lock:
-            for symbol in list(self.clients.get(client_id, [])):
-                if symbol in self.subscribers:
-                    self.subscribers[symbol].discard(client_id)
-                    if not self.subscribers[symbol]:
-                        del self.subscribers[symbol]
-            for reg in [self.clients, self.heartbeats]:
-                reg.pop(client_id, None)
-            no_clients = not self.clients
-
-        self.logger.info(f"Client {cid} rimosso. Clients rimasti: {len(self.clients)}")
-
-        if no_clients:
-            self.logger.info("Nessun client: reset")
-            self._reset_event.set()
-
-    # ------------------------------------------------------------------
-    # Historical request handler
-    # ------------------------------------------------------------------
-    def _handle_historical(self, msg_str: str) -> dict:
-        """
-        Gestisce HISTORICAL|asset|symbol|timeframe|from|to|limit.
-        Restituisce bar dai log file (pre-replay_date) come DataFrame pickle.
-        Ignora il range di date nella request — usa sempre le bar prima del replay_date.
-        """
+    def _handle_historical(self, message):
         try:
-            parts = msg_str.split('|')
+            parts = message.split('|')
             if len(parts) != 7 or parts[0] != 'HISTORICAL':
-                return {'ok': False, 'error': f'Formato non valido: {msg_str[:80]}', 'df': None}
+                raise ValueError('Formato richiesta storico non valido')
+            _, asset, symbol, timeframe, _, _, limit = parts
+            if asset != 'stock' or timeframe.lower() not in ('minute', 'minutes', '1min'):
+                raise ValueError('Replay: storico disponibile solo per barre minute azionarie')
+            limit = int(limit)
+            if not 1 <= limit <= 10000:
+                raise ValueError('Limite storico non valido')
+            if symbol not in self.available:
+                raise ValueError('Nessun dato per il simbolo')
+            rows = []
+            history = list(self.db.execute('SELECT payload FROM history WHERE symbol=? ORDER BY ns DESC,id DESC LIMIT ?',
+                                           (symbol, limit)))
+            for raw, in reversed(history):
+                entry = json.loads(raw)
+                dt, _ = parse_timestamp(entry['timestamp'])
+                rows.append({**entry, 'timestamp': self._remap_datetime(dt), 'symbol': symbol})
+            frame = pd.DataFrame(rows)
+            if not frame.empty:
+                frame = frame.set_index('timestamp')
+            return {'ok': True, 'df': frame}
+        except (ValueError, TypeError) as exc:
+            return {'ok': False, 'error': str(exc), 'df': None}
 
-            _, asset_class, symbol, timeframe, _, _, limit_str = parts
-            limit = int(limit_str)
+    def _preview(self, enabled):
+        client_id = b'dashboard-replay'
+        if not enabled:
+            self._remove_client(client_id)
+            self.preview_requested = False
+            if self.preview_socket:
+                self.preview_socket.close(0)
+                self.preview_socket = None
+            return b'ACK'
+        if self.preview_requested:
+            return b'ACK'
+        self.preview_socket = self.context.socket(zmq.SUB)
+        self.preview_socket.setsockopt(zmq.LINGER, 0)
+        self.preview_socket.setsockopt(zmq.RCVHWM, 10000)
+        self.preview_socket.setsockopt(zmq.SUBSCRIBE, b'')
+        self.preview_socket.connect(f'tcp://127.0.0.1:{self.pub_port}')
+        self.preview_requested = True
+        self.preview_generation += 1
+        self.preview_rows.clear()
+        self.sequence = 0
+        # Register exactly the channels available per symbol, atomically before starting the clock.
+        self.clients[client_id] = {(symbol, channel) for symbol, channels in self.available.items() for channel in channels}
+        self.names[client_id] = 'Dashboard replay'
+        self.heartbeats[client_id] = time.time()
+        if self.state == 'IDLE':
+            self._start_clock()
+        return b'ACK'
 
-            sym_data = self.symbol_bars.get(symbol)
-            if not sym_data:
-                self.logger.warning(f"HISTORICAL: simbolo {symbol} non trovato")
-                return {'ok': True, 'df': pd.DataFrame()}
-
-            # Bar PRIMA del replay_date (per warmup indicatori)
-            replay_start = datetime(
-                self.replay_date.year, self.replay_date.month, self.replay_date.day,
-                tzinfo=timezone.utc
-            )
-            pre_bars = sorted(
-                (b for b in sym_data['all'].values() if b['timestamp'] < replay_start),
-                key=lambda x: x['timestamp']
-            )
-            pre_bars = pre_bars[-limit:]   # Ultime N prima del replay_date
-
-            if not pre_bars:
-                self.logger.warning(f"HISTORICAL: nessuna bar pre-{self.replay_date} per {symbol}")
-                return {'ok': True, 'df': pd.DataFrame()}
-
-            rows = [{
-                'timestamp':   self._remap_ts(b['timestamp']),
-                'open':        b['open'],
-                'high':        b['high'],
-                'low':         b['low'],
-                'close':       b['close'],
-                'volume':      b['volume'],
-                'trade_count': b.get('trade_count', 0),
-                'vwap':        b.get('vwap', 0),
-                'symbol':      symbol,
-            } for b in pre_bars]
-
-            df = pd.DataFrame(rows).set_index('timestamp')
-            self.logger.info(
-                f"HISTORICAL {symbol}: {len(df)} bar pre-{self.replay_date} (richieste {limit})"
-            )
-            return {'ok': True, 'df': df}
-
-        except Exception as e:
-            self.logger.error(f"Errore HISTORICAL: {e}")
-            return {'ok': False, 'error': str(e), 'df': None}
-
-    # ------------------------------------------------------------------
-    # Request thread (REQ/REP)
-    # ------------------------------------------------------------------
-    def _request_thread(self):
-        """Thread: gestisce messaggi REQ/REP dei client."""
-        self.logger.info(f"Request thread avviato (porta {self.req_port})")
-        while self._running:
-            try:
-                parts = self.router.recv_multipart()
-            except zmq.Again:
-                continue
-            except zmq.ZMQError as e:
-                if self._running:
-                    self.logger.error(f"ZMQ error: {e}")
-                    time.sleep(0.5)
-                continue
-            except Exception as e:
-                if self._running:
-                    self.logger.error(f"Request thread error: {e}")
-                continue
-
-            if len(parts) == 3:
-                client_id, _, message = parts
-            elif len(parts) == 2:
-                client_id, message = parts
-            else:
-                continue
-
-            cid = self._get_client_id_str(client_id)
-            with self._lock:
+    def _dispatch(self, client_id, message):
+        if message.startswith('HISTORICAL'):
+            return pickle.dumps(self._handle_historical(message))
+        if message in ('CONFIG', 'HELLO', 'ADMIN'):
+            return json.dumps({'mode': 'replay', 'state': self.state, 'available': self.available,
+                               'heartbeat_timeout_s': self.HEARTBEAT_TIMEOUT, 'recommended_heartbeat_s': 15}).encode()
+        if message == 'HEARTBEAT':
+            if client_id in self.clients:
                 self.heartbeats[client_id] = time.time()
+            return b'PONG'
+        if message == 'DISCONNECT':
+            self._remove_client(client_id)
+            return b'BYE'
+        if message == 'PREVIEW:START':
+            if self.state == 'EOD_SIGNALED':
+                return b'ERR:REPLAY_COMPLETE_DISCONNECT_OR_RESET'
+            return self._preview(True)
+        if message == 'PREVIEW:STOP':
+            return self._preview(False)
+        if message == 'RESET':
+            if any(cid != b'dashboard-replay' for cid in self.clients):
+                return b'ERR:OTHER_CLIENTS_CONNECTED'
+            self._preview(False)
+            self.state = 'IDLE'
+            return b'ACK'
+        if message.startswith('REGISTER:'):
+            application = json.loads(message.split(':', 1)[1]).get('application')
+            if not isinstance(application, str) or not application or len(application) > 120:
+                return b'ERR:INVALID_APPLICATION'
+            self.names[client_id] = application
+            return b'ACK-REGISTER'
+        if message.startswith('SUBSCRIBE:'):
+            payload = json.loads(message.split(':', 1)[1])
+            return self._register(client_id, payload.get('symbols'), payload.get('channels'), payload.get('application'))
+        for prefix, channel in [('MIN:', 'minute'), ('SUB:', 'minute'), ('QUOTE:', 'quote'), ('TRADE:', 'trade')]:
+            if message.startswith(prefix):
+                return self._register(client_id, [message.split(':', 1)[1]], [channel])
+        return b'ERR:UNSUPPORTED_COMMAND'
 
-            try:
-                msg_str = message.decode('utf-8', errors='replace').strip()
-            except Exception:
-                msg_str = ''
+    def _remap_datetime(self, dt):
+        if not self.remap_today:
+            return dt
+        return (dt.astimezone(ZoneInfo('America/New_York')) + self.date_delta).astimezone(timezone.utc)
 
-            # ----- Dispatch -----
-            try:
-                if msg_str.upper() == 'HEARTBEAT':
-                    self.router.send_multipart([client_id, b'', b'PONG'])
+    def _publish(self, symbol, channel, entry):
+        timestamp = entry['timestamp']
+        if self.remap_today:
+            dt, _ = parse_timestamp(timestamp)
+            fraction = re.search(r':\d{2}(\.\d+)', timestamp)
+            timestamp = self._remap_datetime(dt).strftime('%Y-%m-%dT%H:%M:%S') + (fraction.group(1) if fraction else '') + '+00:00'
+        payload = {**entry, 'type': 'bar' if channel == 'minute' else channel,
+                   'daily': False, 'asset_class': 'stock', 'symbol': symbol, 'ts': timestamp,
+                   'timestamp': timestamp, 'recorded_timestamp': entry['timestamp'],
+                   'replay': True, 'proxy_ts': time.time()}
+        self.publisher.send_multipart([symbol.encode(), msgpack.packb(payload, use_bin_type=True)])
+        self.published += 1
 
-                elif msg_str.startswith('MIN:') or msg_str.startswith('SUB:'):
-                    symbol = msg_str.split(':', 1)[1]
-                    self._handle_subscribe(client_id, symbol, 'intraday')
-                    self.router.send_multipart([client_id, b'', b'ACK'])
-
-                elif msg_str.startswith('MIN_CRYPTO:'):
-                    symbol = msg_str.split(':', 1)[1]
-                    self._handle_subscribe(client_id, symbol, 'intraday')
-                    self.router.send_multipart([client_id, b'', b'ACK-CRYPTO'])
-
-                elif msg_str.startswith('DAY:'):
-                    # Daily non supportato in replay intraday, ACK comunque
-                    self.router.send_multipart([client_id, b'', b'ACK-DAILY'])
-                    self.logger.debug(f"DAY subscription ignorata (replay intraday only)")
-
-                elif msg_str.startswith('DAY_CRYPTO:'):
-                    self.router.send_multipart([client_id, b'', b'ERR:DAY_CRYPTO_NOT_SUPPORTED'])
-
-                elif msg_str.startswith('HISTORICAL|') or msg_str.startswith('HISTORICAL:'):
-                    payload = self._handle_historical(msg_str)
-                    self.router.send_multipart([client_id, b'', pickle.dumps(payload)])
-
-                elif msg_str == 'DISCONNECT':
-                    self._remove_client(client_id)
-                    self.router.send_multipart([client_id, b'', b'BYE'])
-                    self.logger.info(f"Disconnessione {cid}")
-
-                else:
-                    self.logger.debug(f"Messaggio non riconosciuto da {cid}: {msg_str[:60]}")
-                    self.router.send_multipart([client_id, b'', b'UNKNOWN'])
-
-            except zmq.ZMQError as e:
-                self.logger.error(f"ZMQ error sending to {cid}: {e}")
-            except Exception as e:
-                self.logger.error(f"Error handling message from {cid}: {e}")
-
-    # ------------------------------------------------------------------
-    # Heartbeat cleanup thread
-    # ------------------------------------------------------------------
-    def _cleanup_thread(self):
-        """Thread: rimuove client con heartbeat scaduto."""
-        while self._running:
-            time.sleep(15)
-            now = time.time()
-            with self._lock:
-                dead = [
-                    cid for cid, ts in list(self.heartbeats.items())
-                    if now - ts > self.HEARTBEAT_TIMEOUT
-                ]
-            for client_id in dead:
-                self.logger.warning(
-                    f"Client {self._get_client_id_str(client_id)} timeout ({self.HEARTBEAT_TIMEOUT}s)"
-                )
-                self._remove_client(client_id)
-
-    # ------------------------------------------------------------------
-    # Start / Stop
-    # ------------------------------------------------------------------
-    def start(self):
-        """Avvia tutti i thread e blocca fino a Ctrl+C."""
-        if not self.all_ticks:
-            self.logger.error(f"Nessun dato caricato per {self.replay_date}. "
-                              f"Verifica --log-dir e --date.")
+    def _advance(self):
+        if self.state != 'REPLAYING' or not self.next_event:
             return
+        active = set().union(*self.clients.values()) if self.clients else set()
+        # Limit each burst to keep commands, heartbeats and the preview consumer responsive.
+        for _ in range(100):
+            ns, symbol, channel, raw = self.next_event
+            due = self.wall_origin + ((ns - self.clock_origin_ns) / 1e9 / self.speed if self.speed else 0)
+            if time.monotonic() < due:
+                break
+            if (symbol, channel) in active:
+                self._publish(symbol, channel, json.loads(raw))
+            self.next_event = self.cursor.fetchone()
+            if not self.next_event:
+                self.state = 'EOD_SIGNALED'
+                self._eod('day_complete')
+                break
 
-        self.logger.info(
-            f"Proxy in ascolto su REQ=tcp://*:{self.req_port}, PUB=tcp://*:{self.pub_port}"
-        )
-        self.logger.info(
-            f"Per usarlo con btmain.py:\n"
-            f"  export PROXY_ADDR=tcp://localhost:{self.req_port}\n"
-            f"  export proxy_pub_addr=tcp://localhost:{self.pub_port}"
-        )
+    def _eod(self, reason):
+        eod = {'type': 'EOD', 'symbol': '*', 'ts': None, 'replay': True, 'reason': reason}
+        self.publisher.send_multipart([b'*', msgpack.packb(eod, use_bin_type=True)])
 
-        req_t     = threading.Thread(target=self._request_thread, name='req',     daemon=True)
-        cleanup_t = threading.Thread(target=self._cleanup_thread, name='cleanup', daemon=True)
-        replay_t  = threading.Thread(target=self._replay_loop,    name='replay',  daemon=False)
-
-        req_t.start()
-        cleanup_t.start()
-        replay_t.start()
-
-        try:
-            replay_t.join()
-        except KeyboardInterrupt:
-            self.logger.info("Ctrl+C: arresto...")
-        finally:
-            self._running = False
-            self._start_event.set()   # sblocca thread in wait
-            self._reset_event.set()
+    def _receive_preview(self):
+        if not self.preview_socket:
+            return
+        for _ in range(1000):
             try:
-                self.router.close(linger=0)
-                self.publisher.close(linger=0)
-                self.context.term()
-            except Exception:
-                pass
-            self.logger.info("Proxy fermato.")
+                _, raw = self.preview_socket.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            entry = msgpack.unpackb(raw, raw=False)
+            if entry.get('type') == 'EOD':
+                continue
+            self.sequence += 1
+            self.preview_rows.append({**entry, 'event_type': entry['type'], 'sequence': self.sequence})
+
+    def start(self):
+        try:
+            while self.running and self._parent_alive():
+                if self.router.poll(1 if self.state == 'REPLAYING' else 50):
+                    frames = self.router.recv_multipart()
+                    if len(frames) in (2, 3):
+                        client_id, raw = frames[0], frames[-1]
+                        try:
+                            reply = self._dispatch(client_id, raw.decode().strip())
+                        except (ValueError, TypeError, KeyError, AttributeError):
+                            reply = b'ERR:INVALID_REQUEST'
+                        self.router.send_multipart([client_id, b'', reply])
+                self._advance()
+                self._receive_preview()
+                now = time.time()
+                if now - self.last_cleanup > 5:
+                    self.last_cleanup = now
+                    for cid, heartbeat in list(self.heartbeats.items()):
+                        if cid != b'dashboard-replay' and now - heartbeat > self.HEARTBEAT_TIMEOUT:
+                            self._remove_client(cid)
+                self._status()
+        finally:
+            self.close()
+
+    def close(self):
+        self.running = False
+        if self.state == 'REPLAYING' and self.clients:
+            self._eod('replay_stop')
+        if self.preview_socket:
+            self.preview_socket.close(0)
+            self.preview_socket = None
+        self.preview_requested = False
+        self.state = 'STOPPED' if not self.error else 'ERROR'
+        self._status(force=True)
+        self.router.close(0)
+        self.publisher.close(250)
+        self.context.term()
+        self.db.close()
+        self.temporary.cleanup()
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 def parse_args():
-    p = argparse.ArgumentParser(
-        description='Replay ZMQ Proxy — riproduce giornate di trading da file di log',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Esempi:
-  python replay_zmq_proxy.py --date 2026-01-12 --speed 60
-  python replay_zmq_proxy.py --date 2026-01-12 --speed 0   # massima velocità
-  python replay_zmq_proxy.py --date 2026-01-12 --speed 1   # real-time
-
-Per usarlo con btmain.py:
-  export PROXY_ADDR=tcp://localhost:5557
-  export proxy_pub_addr=tcp://localhost:5558
-  python btmain.py --strat intraday.HMADynamic --ticker LCID \\
-    --mode backtest --provider alpaca --alpaca-mode proxy --timeframe minutes
-"""
-    )
-    p.add_argument('--date', required=True,
-                   help='Data da replicare (YYYY-MM-DD)')
-    p.add_argument('--speed', type=float, default=10.0,
-                   help='Velocità: 1=real-time, 60=60x, 0=max (default: 10)')
-    p.add_argument('--log-dir', default='out/dump',
-                   help='Directory log di zmq_logger (default: out/dump)')
-    p.add_argument('--req-port', type=int, default=ReplayProxy.DEFAULT_REQ_PORT,
-                   help=f'Porta REQ/REP (default: {ReplayProxy.DEFAULT_REQ_PORT})')
-    p.add_argument('--pub-port', type=int, default=ReplayProxy.DEFAULT_PUB_PORT,
-                   help=f'Porta PUB/SUB (default: {ReplayProxy.DEFAULT_PUB_PORT})')
-    p.add_argument('--log-level', default='INFO',
-                   choices=['DEBUG', 'INFO', 'WARNING'],
-                   help='Livello di logging (default: INFO)')
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--date', required=True)
+    parser.add_argument('--speed', type=float, default=10)
+    parser.add_argument('--symbols', help='Ticker separati da virgola; senza opzione legge tutti gli archivi')
+    parser.add_argument('--session', choices=['all', 'rth', 'ah'], default='all')
+    parser.add_argument('--log-dir', default=str(ROOT / 'out/dump'))
+    parser.add_argument('--req-port', type=int, default=5557)
+    parser.add_argument('--pub-port', type=int, default=5558)
+    parser.add_argument('--status-file')
+    parser.add_argument('--parent-pid', type=int)
+    parser.add_argument('--remap-today', action='store_true')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING'], default='INFO')
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
+    logging.basicConfig(level=getattr(logging, args.log_level))
+    symbols = args.symbols.split(',') if args.symbols else None
+    if symbols and (len(symbols) > 20 or any(not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', s) for s in symbols)):
+        raise SystemExit('Lista simboli non valida')
+    proxy = None
     try:
-        replay_date = date.fromisoformat(args.date)
-    except ValueError:
-        print(f"Errore: data non valida '{args.date}'. Formato atteso: YYYY-MM-DD")
-        sys.exit(1)
-
-    proxy = ReplayProxy(
-        replay_date=replay_date,
-        speed=args.speed,
-        log_dir=args.log_dir,
-        req_port=args.req_port,
-        pub_port=args.pub_port,
-        log_level=getattr(logging, args.log_level),
-    )
-    proxy.load_log_files()
-    proxy.start()
+        proxy = ReplayProxy(date.fromisoformat(args.date), args.speed, args.log_dir,
+                            args.req_port, args.pub_port, getattr(logging, args.log_level),
+                            symbols, args.session, args.status_file, args.remap_today, args.parent_pid)
+        def stop(*_):
+            proxy.running = False
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        proxy.load_log_files()
+        proxy.start()
+    except Exception as exc:
+        if proxy and proxy.running:
+            proxy.error = str(exc)
+            proxy.close()
+        logging.exception('Replay non avviato')
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

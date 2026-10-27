@@ -32,6 +32,10 @@ class QuoteProtocolTest(unittest.TestCase):
         proxy.client_quote_assets = defaultdict(set)
         proxy.quote_asset_subscribers = defaultdict(set)
         proxy.active_alpaca_quote_symbols = set()
+        proxy.client_trade_assets = defaultdict(set)
+        proxy.trade_asset_subscribers = defaultdict(set)
+        proxy.active_alpaca_trade_symbols = set()
+        proxy.client_applications = {}
         proxy._send_worker_command = Mock()
         return proxy
 
@@ -63,6 +67,7 @@ class QuoteProtocolTest(unittest.TestCase):
         worker.logger = logging.getLogger("test-worker")
         worker.alpaca_stream = Mock()
         worker.active_alpaca_quote_symbols = set()
+        worker.active_alpaca_trade_symbols = set()
         worker.active_alpaca_symbols = set()
         worker.active_alpaca_daily_symbols = set()
         worker._ensure_streams_started = Mock()
@@ -78,6 +83,62 @@ class QuoteProtocolTest(unittest.TestCase):
         worker.alpaca_stream.unsubscribe_quotes.assert_called_once_with("MSFT")
         worker._reset_stock_stream.assert_called_once()
 
+    def test_trade_subscriptions_share_upstream_and_release_last_client(self):
+        proxy = self.make_proxy()
+        proxy._add_subscription(b"one", "AAPL", timeframe="trade")
+        proxy._add_subscription(b"two", "AAPL", timeframe="trade")
+        self.assertEqual(proxy._send_worker_command.call_count, 1)
+        proxy._safe_remove_client(b"one")
+        self.assertEqual(proxy._send_worker_command.call_count, 1)
+        proxy._safe_remove_client(b"two")
+        self.assertEqual(proxy._send_worker_command.call_args.kwargs["timeframe"], "trade")
+        self.assertFalse(proxy.active_alpaca_trade_symbols)
+
+    def test_quote_unsubscribe_keeps_stream_running_for_trades(self):
+        worker = worker_module.AlpacaStreamWorker.__new__(worker_module.AlpacaStreamWorker)
+        worker.logger = logging.getLogger("test-worker")
+        worker.alpaca_stream = Mock()
+        worker.active_alpaca_quote_symbols = {"MSFT"}
+        worker.active_alpaca_trade_symbols = {"MSFT"}
+        worker.active_alpaca_symbols = set()
+        worker.active_alpaca_daily_symbols = set()
+        worker._reset_stock_stream = Mock()
+        worker._unsubscribe("MSFT", "quote", "stock")
+        worker._reset_stock_stream.assert_not_called()
+        worker._unsubscribe("MSFT", "trade", "stock")
+        worker._reset_stock_stream.assert_called_once()
+
+    def test_admin_lists_full_client_identity_and_channels(self):
+        from alpaca.data.enums import DataFeed
+        proxy = self.make_proxy()
+        proxy._data_feed = DataFeed.SIP
+        proxy.worker_process = None
+        client = b"bt-core:123:AAPL:unique"
+        proxy._add_subscription(client, "AAPL", timeframe="trade")
+        snapshot = proxy._admin_snapshot()
+        self.assertEqual(snapshot["clients"][0]["identity"], client.decode())
+        self.assertEqual(snapshot["clients"][0]["application"], "bt-core")
+        self.assertEqual(snapshot["clients"][0]["subscriptions"], [{"symbol": "AAPL", "channel": "trade"}])
+
+    def test_trade_callback_and_logger_preserve_real_tick_fields(self):
+        import asyncio
+        import datetime
+        import msgpack
+        from types import SimpleNamespace
+        from alpaca.data.enums import DataFeed
+        worker = worker_module.AlpacaStreamWorker.__new__(worker_module.AlpacaStreamWorker)
+        worker.event_socket = Mock()
+        worker.data_feed = DataFeed.SIP
+        tick = SimpleNamespace(symbol="AAPL", timestamp=datetime.datetime.now(datetime.timezone.utc),
+                               price=100.5, size=3, exchange="Q", id=123, conditions=["@"], tape="C")
+        asyncio.run(worker._alpaca_trade_callback(tick))
+        payload = msgpack.unpackb(worker.event_socket.send_multipart.call_args.args[0][1], raw=False)
+        entry = zmq_logger._build_log_entry(payload)
+        self.assertEqual(entry["event_type"], "trade")
+        self.assertEqual(entry["price"], 100.5)
+        self.assertEqual(entry["size"], 3)
+        self.assertNotIn("close", entry)
+
     def test_logger_preserves_quote_execution_fields(self):
         entry = zmq_logger._build_log_entry(
             {
@@ -91,6 +152,9 @@ class QuoteProtocolTest(unittest.TestCase):
                 "ask_size": 5,
                 "bid_exchange": "Q",
                 "ask_exchange": "P",
+                "conditions": ["R"],
+                "tape": "C",
+                "feed": "sip",
                 "mid": 100.05,
                 "spread": 0.1,
                 "spread_bps": 9.995,
@@ -99,6 +163,9 @@ class QuoteProtocolTest(unittest.TestCase):
 
         self.assertEqual(entry["event_type"], "quote")
         self.assertEqual(entry["timeframe"], "quote")
+        self.assertEqual(entry["conditions"], ["R"])
+        self.assertEqual(entry["feed"], "sip")
+        self.assertEqual(entry["tape"], "C")
         for field in (
             "bid_price",
             "ask_price",

@@ -81,6 +81,10 @@ class AlpacaSmartProxy:
         self.client_quote_assets = defaultdict(set)
         self.quote_asset_subscribers = defaultdict(set)
         self.active_alpaca_quote_symbols = set()
+        self.client_trade_assets = defaultdict(set)
+        self.trade_asset_subscribers = defaultdict(set)
+        self.active_alpaca_trade_symbols = set()
+        self.client_applications = {}
 
         if FEED == "sip":
             data_feed = DataFeed.SIP
@@ -128,9 +132,30 @@ class AlpacaSmartProxy:
 
     def _client_config(self):
         return {
+            "feed": self._data_feed.value,
             "heartbeat_timeout_s": HEARTBEAT_TIMEOUT_S,
             "recommended_heartbeat_s": max(1, HEARTBEAT_TIMEOUT_S // 2),
         }
+
+    def _admin_snapshot(self):
+        clients = []
+        now = time.time()
+        for client_id, heartbeat in list(self.heartbeats.items()):
+            identity = client_id.decode("utf-8", errors="replace")
+            application = self.client_applications.get(client_id)
+            if not application and identity.startswith("bt-core:"):
+                application = "bt-core"
+            clients.append({
+                "id": client_id.hex(), "identity": identity,
+                "application": application or "Client senza nome (legacy)",
+                "last_heartbeat": heartbeat, "heartbeat_age_seconds": max(0, now - heartbeat),
+                "subscriptions": [{"symbol": symbol, "channel": channel}
+                    for channel, registry in [("minute", self.client_assets), ("daily", self.client_daily_assets),
+                                              ("quote", self.client_quote_assets), ("trade", self.client_trade_assets)]
+                    for symbol in sorted(registry.get(client_id, set()))],
+            })
+        return {**self._client_config(), "clients": clients, "sampled_at": now,
+                "worker_pid": self.worker_process.pid if self.worker_process else None}
 
     def _broadcast_eod(self, reason="proxy_stop"):
         eod_msg = {
@@ -244,7 +269,14 @@ class AlpacaSmartProxy:
                     self.active_alpaca_quote_symbols.discard(symbol)
                     self.logger.info("Rimosso simbolo quote %s (nessun client)", symbol)
 
-            for registry in [self.client_assets, self.client_daily_assets, self.client_quote_assets, self.heartbeats]:
+            for symbol in list(self.client_trade_assets.get(client_id, set())):
+                self.trade_asset_subscribers[symbol].discard(client_id)
+                if not self.trade_asset_subscribers[symbol]:
+                    self._send_worker_command("unsubscribe", symbol=symbol, timeframe="trade", asset_class="stock")
+                    self.active_alpaca_trade_symbols.discard(symbol)
+                    self.logger.info("Rimosso simbolo trade %s (nessun client)", symbol)
+
+            for registry in [self.client_assets, self.client_daily_assets, self.client_quote_assets, self.client_trade_assets, self.client_applications, self.heartbeats]:
                 if client_id in registry:
                     del registry[client_id]
 
@@ -271,6 +303,14 @@ class AlpacaSmartProxy:
                 subscribers = self.quote_asset_subscribers
                 active_symbols = self.active_alpaca_quote_symbols
                 sub_type = "quote"
+            elif timeframe == "trade":
+                if is_crypto:
+                    raise ValueError("Sottoscrizione trade crypto non supportata in questo proxy")
+                prev_count = len(self.trade_asset_subscribers.get(symbol, set()))
+                registry = self.client_trade_assets
+                subscribers = self.trade_asset_subscribers
+                active_symbols = self.active_alpaca_trade_symbols
+                sub_type = "trade"
             else:
                 prev_count = len(self.asset_subscribers.get(symbol, set()))
                 registry = self.client_assets
@@ -290,7 +330,7 @@ class AlpacaSmartProxy:
             )
 
             if prev_count == 0 and symbol not in active_symbols:
-                worker_timeframe = "daily" if timeframe == "daily" else "quote" if timeframe == "quote" else "minute"
+                worker_timeframe = "daily" if timeframe == "daily" else timeframe if timeframe in ("quote", "trade") else "minute"
                 self._send_worker_command(
                     "subscribe",
                     symbol=symbol,
@@ -410,12 +450,26 @@ class AlpacaSmartProxy:
                     self._add_subscription(client_id, symbol, timeframe="quote")
                     self.router.send_multipart([client_id, b"", b"ACK-QUOTE"])
                     self.logger.info("Sottoscrizione quote %s da %s", symbol, client_id_str)
+                elif msg_str.startswith("TRADE:"):
+                    symbol = msg_str.split(":", 1)[1] if ":" in msg_str else "UNKNOWN"
+                    self._add_subscription(client_id, symbol, timeframe="trade")
+                    self.router.send_multipart([client_id, b"", b"ACK-TRADE"])
+                    self.logger.info("Sottoscrizione trade %s da %s", symbol, client_id_str)
                 elif msg_str.startswith("QUOTE_META:"):
                     symbol = msg_str.split(":", 1)[1] if ":" in msg_str else "UNKNOWN"
                     self._add_subscription(client_id, symbol, timeframe="quote")
                     metadata = json.dumps(self._client_config()).encode("utf-8")
                     self.router.send_multipart([client_id, b"", b"ACK-QUOTE", metadata])
                     self.logger.info("Sottoscrizione quote %s da %s (metadata)", symbol, client_id_str)
+                elif msg_str.startswith("REGISTER:"):
+                    application = json.loads(msg_str.split(":", 1)[1]).get("application", "")
+                    if not isinstance(application, str) or not application.strip() or len(application) > 120:
+                        self.router.send_multipart([client_id, b"", b"ERR:INVALID_APPLICATION"])
+                    else:
+                        self.client_applications[client_id] = application.strip()
+                        self.router.send_multipart([client_id, b"", b"ACK-REGISTER"])
+                elif msg_str.upper() == "ADMIN":
+                    self.router.send_multipart([client_id, b"", b"ADMIN", json.dumps(self._admin_snapshot()).encode()])
                 elif msg_str.upper() in {"CONFIG", "HELLO"}:
                     metadata = json.dumps(self._client_config()).encode("utf-8")
                     self.router.send_multipart([client_id, b"", b"CONFIG", metadata])

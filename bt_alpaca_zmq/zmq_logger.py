@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+try:
+    from .quote_monitor import QuoteMonitor
+except ImportError:
+    from quote_monitor import QuoteMonitor
+
 # Configurazione ZeroMQ:
 # Priorita':
 # 1) proxy_pub_addr (compatibile con env/zmq)
@@ -59,6 +64,11 @@ def _build_log_entry(message: Dict[str, Any]) -> Dict[str, Any]:
     """Prepara una riga pronta per essere salvata (formato flat msgpack)."""
     recv_ts = datetime.now(timezone.utc).isoformat()
     symbol = message.get("symbol") or "UNKNOWN"
+    if message.get("type") == "trade":
+        return {"recv_ts": recv_ts, "proxy_ts": _format_epoch(message.get("proxy_ts")),
+                "timeframe": "trade", "event_type": "trade", "symbol": symbol,
+                "timestamp": message.get("ts"),
+                **{key: message.get(key) for key in ("price", "size", "exchange", "trade_id", "conditions", "tape", "feed")}}
     if message.get("type") == "quote":
         return {
             "recv_ts":      recv_ts,
@@ -73,6 +83,9 @@ def _build_log_entry(message: Dict[str, Any]) -> Dict[str, Any]:
             "ask_size":     message.get("ask_size"),
             "bid_exchange": message.get("bid_exchange"),
             "ask_exchange": message.get("ask_exchange"),
+            "conditions":   message.get("conditions"),
+            "tape":         message.get("tape"),
+            "feed":         message.get("feed"),
             "mid":          message.get("mid"),
             "spread":       message.get("spread"),
             "spread_bps":   message.get("spread_bps"),
@@ -102,10 +115,14 @@ def setup_zmq_subscriber():
     subscriber.setsockopt_string(zmq.SUBSCRIBE, "")  # riceve tutti i topic (inclusi EOD '*')
 
     logging.info(f"ZMQ Logger avviato. In ascolto su {ZMQ_SERVER_ADDR}...")
+    monitor = QuoteMonitor(context)
 
     try:
         while True:
             try:
+                monitor.tick()
+                if not subscriber.poll(200):
+                    continue
                 frames = subscriber.recv_multipart()
                 if len(frames) != 2:
                     logging.warning("Frame count inatteso: %d", len(frames))
@@ -124,6 +141,7 @@ def setup_zmq_subscriber():
 
                 entry = _build_log_entry(message)
                 _write_entry(entry["symbol"], entry)
+                monitor.observe(entry)
 
             except (msgpack.UnpackException, zmq.ZMQError) as e:
                 logging.exception(e)
@@ -135,6 +153,7 @@ def setup_zmq_subscriber():
     except KeyboardInterrupt:
         logging.info("Logger interrotto manualmente.")
     finally:
+        monitor.close()
         subscriber.close()
         context.term()
 
