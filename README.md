@@ -9,11 +9,16 @@ Gateway services for ZMQ market data flow:
 ## Setup
 
 ```bash
-python3 -m venv .venv
+../.runtime/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -e .
 ```
+
+Keep the gateway virtualenv separate from `bt-core/.venv`. Use the workspace
+Python runtime rather than `/usr/bin/python`: a system Python upgrade can leave
+the virtualenv pointing at a different minor version and hide installed packages.
+The systemd proxy and logger both use `bt-gateway/.venv`.
 
 ## Commands
 
