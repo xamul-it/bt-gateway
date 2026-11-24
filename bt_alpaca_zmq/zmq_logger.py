@@ -140,7 +140,8 @@ def setup_zmq_subscriber():
                     continue
 
                 entry = _build_log_entry(message)
-                _write_entry(entry["symbol"], entry)
+                if monitor.should_record(entry, message.get('_external_subscriber')):
+                    _write_entry(entry["symbol"], entry)
                 monitor.observe(entry)
 
             except (msgpack.UnpackException, zmq.ZMQError) as e:

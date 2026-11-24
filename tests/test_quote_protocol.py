@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import unittest
+import msgpack
 from collections import defaultdict
 from pathlib import Path
 from unittest.mock import Mock
@@ -61,6 +62,14 @@ class QuoteProtocolTest(unittest.TestCase):
             {"symbol": "AAPL", "timeframe": "quote", "asset_class": "stock"},
         )
         self.assertFalse(proxy.active_alpaca_quote_symbols)
+
+    def test_ownership_metadata_tracks_shared_subscriptions(self):
+        proxy = self.make_proxy()
+        event = msgpack.packb({'type': 'quote', 'symbol': 'AAPL'}, use_bin_type=True)
+        proxy._add_subscription(b'quote-monitor-123', 'AAPL', timeframe='quote')
+        assert msgpack.unpackb(proxy._mark_event_owners(event), raw=False)['_external_subscriber'] is False
+        proxy._add_subscription(b'strategy', 'AAPL', timeframe='quote')
+        assert msgpack.unpackb(proxy._mark_event_owners(event), raw=False)['_external_subscriber'] is True
 
     def test_worker_deduplicates_quote_subscription_and_resets_stream(self):
         worker = worker_module.AlpacaStreamWorker.__new__(worker_module.AlpacaStreamWorker)

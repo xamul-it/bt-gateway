@@ -45,3 +45,21 @@ class MonitorTest(unittest.TestCase):
                 self.assertFalse(data['proxy_connected'])
                 self.assertEqual(data['error'], 'Proxy timeout')
                 self.assertEqual(monitor.last_subscription, 0)
+
+
+def test_recording_channels_live_only_and_other_client(tmp_path):
+    config, status = tmp_path / 'config.json', tmp_path / 'status.json'
+    config.write_text(json.dumps({'symbols': ['AAPL'], 'channels': {'AAPL': ['MIN']},
+                                  'live_sessions': {'x': {'symbol': 'MSFT', 'expires': 9999999999}}}))
+    monitor = module.QuoteMonitor(Mock())
+    monitor.command = Mock(return_value=[b'CONFIG', b'{"feed":"sip","clients":[]}'])
+    with patch.object(module, 'CONFIG', config), patch.object(module, 'STATUS', status):
+        monitor.tick(force=True)
+        commands = [c.args[0] for c in monitor.command.call_args_list]
+        assert 'MIN:AAPL' in commands and 'QUOTE:AAPL' not in commands
+        assert 'QUOTE:MSFT' in commands and 'TRADE:MSFT' in commands
+        assert monitor.should_record({'symbol': 'AAPL', 'timeframe': 'intraday'})
+        assert not monitor.should_record({'symbol': 'AAPL', 'timeframe': 'quote'}, False)
+        assert not monitor.should_record({'symbol': 'MSFT', 'timeframe': 'quote'}, False)
+        assert monitor.should_record({'symbol': 'MSFT', 'timeframe': 'quote'}, True)
+        assert monitor.should_record({'symbol': 'MSFT', 'timeframe': 'quote'})

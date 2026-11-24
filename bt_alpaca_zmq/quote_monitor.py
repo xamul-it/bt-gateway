@@ -21,6 +21,8 @@ class QuoteMonitor:
         self.socket = None
         self.identity = f"quote-monitor-{uuid.uuid4().hex}".encode()
         self.symbols = []
+        self.subscriptions = {}
+        self.recordings = {}
         self.last_tick = 0
         self.last_subscription = 0
         self.latest = {}
@@ -63,6 +65,22 @@ class QuoteMonitor:
         if symbol in self.symbols and entry.get("timeframe") in ("quote", "intraday", "trade"):
             self.latest.setdefault(symbol, {})[kind] = entry
 
+    def should_record(self, entry, external_subscriber=None):
+        channel = {'quote': 'QUOTE', 'trade': 'TRADE', 'intraday': 'MIN'}.get(entry.get('timeframe'))
+        if channel is None:
+            return True
+        symbol = entry.get('symbol')
+        if channel in self.recordings.get(symbol, set()):
+            return True
+        if external_subscriber is not None:
+            return external_subscriber
+        if symbol not in self.subscriptions:
+            # Keep the existing logger behavior for unrelated clients, including
+            # clients that have connected since the last ADMIN snapshot.
+            return True
+        # Older proxies do not provide ownership metadata: preserve all data.
+        return True
+
     def tick(self, force=False):
         now = time.time()
         if not force and now - self.last_tick < 1:
@@ -81,18 +99,30 @@ class QuoteMonitor:
                 symbols = list(dict.fromkeys(values))
                 if len(symbols) > 100:
                     raise ValueError("Massimo 100 simboli complessivi")
-                if symbols != self.symbols:
-                    if self.symbols:
+                recordings = {s: set(config.get('channels', {}).get(s, ['MIN', 'QUOTE', 'TRADE'])) for s in config.get('symbols', [])}
+                for group in config.get('sources', {}).values():
+                    for symbol in group:
+                        recordings.setdefault(symbol, set()).update(('MIN', 'QUOTE', 'TRADE'))
+                subscriptions = {s: set(channels) for s, channels in recordings.items()}
+                for session in config.get('live_sessions', {}).values():
+                    if isinstance(session, dict) and session.get('expires', 0) > now:
+                        symbol = session.get('symbol')
+                        if isinstance(symbol, str) and re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', symbol):
+                            subscriptions.setdefault(symbol, set()).update(('MIN', 'QUOTE', 'TRADE'))
+                if subscriptions != self.subscriptions:
+                    if self.subscriptions:
                         self.command("DISCONNECT")
-                    self.symbols = symbols
+                    self.subscriptions = subscriptions
                     self.last_subscription = 0
+                self.symbols = symbols
+                self.recordings = recordings
                 self.command('REGISTER:{"application":"Registratore persistente L1 / Watchtower"}')
                 frames = self.command("ADMIN")
                 self.proxy = json.loads(frames[-1])
                 self.feed = self.proxy.get("feed")
                 if now - self.last_subscription >= 15:
-                    for symbol in self.symbols:
-                        for channel in ("MIN", "QUOTE", "TRADE"):
+                    for symbol, channels in self.subscriptions.items():
+                        for channel in (c for c in ("MIN", "QUOTE", "TRADE") if c in channels):
                             self.command(f"{channel}:{symbol}")
                     self.last_subscription = now
                 self.connected = True

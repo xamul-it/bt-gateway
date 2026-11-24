@@ -378,6 +378,20 @@ class AlpacaSmartProxy:
             except Exception as exc:
                 self.logger.error("Errore in cleanup: %s", exc, exc_info=True)
 
+    def _mark_event_owners(self, payload):
+        message = msgpack.unpackb(payload, raw=False)
+        if not isinstance(message, dict):
+            return payload
+        kind = message.get('type')
+        registry = {'quote': self.quote_asset_subscribers, 'trade': self.trade_asset_subscribers}.get(kind)
+        if registry is None and kind == 'bar':
+            registry = self.daily_asset_subscribers if message.get('daily') else self.asset_subscribers
+        if registry is not None:
+            subscribers = registry.get(message.get('symbol'), set()).copy()
+            message['_external_subscriber'] = any(not client.startswith(b'quote-monitor-') for client in subscribers)
+            return msgpack.packb(message, use_bin_type=True)
+        return payload
+
     def _handle_worker_events(self):
         while self.running:
             try:
@@ -393,7 +407,7 @@ class AlpacaSmartProxy:
                 continue
             topic, payload = parts
             try:
-                self.publisher.send_multipart([topic, payload])
+                self.publisher.send_multipart([topic, self._mark_event_owners(payload)])
             except Exception as exc:
                 self.logger.error("Errore publish verso consumer: %s", exc, exc_info=True)
 
